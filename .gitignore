@@ -1,0 +1,12 @@
+.codex/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime/system artifacts (keep data in the vault; keep secrets out of git)
+system/secrets/
+system/tmp/
+system/logs/
+system/.env
+
