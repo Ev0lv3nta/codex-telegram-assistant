@@ -1,91 +1,91 @@
-# Personal Assistant Vault (Codex)
+# Vault ассистента (Codex)
 
-This repository is the assistant's long-term memory. The chat history is NOT a reliable memory.
-When in doubt, store information in the vault so it can be found later.
+Этот репозиторий — долгосрочная память ассистента. История чата не считается надежной памятью.
+Если сомневаешься, лучше запиши в vault, чтобы потом это можно было найти.
 
-## What This Repo Is For
+## Зачем это
 
-- Capture incoming messages/files (e.g. from Telegram) into a searchable archive.
-- Keep a simple daily journal ("what happened today") with optional summaries.
-- Maintain a few long-lived references (people, read-later list, projects) without creating chaos.
+- Сохранять входящие (например, из Telegram) в поисковый архив.
+- Вести простой дневник по дням ("что было сегодня") с короткими резюме.
+- Держать немного "долгоживущих" справочников (люди, прочитать позже, проекты) без хаоса.
 
-## Folder Map (Do Not Invent New Top-Level Folders)
+## Карта папок (не придумывай новые верхнеуровневые папки)
 
-- `00_inbox/`: raw incoming items (one message/file = one item). Never delete. Rarely rename.
-- `01_capture/daily/`: daily notes `YYYY-MM-DD.md` (main journal + short records of everything).
-- `01_capture/transcripts/`: long transcripts (voice-to-text, meeting dumps) when too big for daily.
-- `01_capture/notes/`: occasional longform notes (conference notes, long writeups) when needed.
-- `01_capture/read_later.md`: a single list of "read/watch later" links.
-- `02_distill/`: optional distilled summaries (only if explicitly requested).
-- `04_projects/`: project folders (only when something is truly ongoing).
-- `88_files/`: documents (pdf/doc/zip/etc). Keep original filenames when possible.
-- `89_images/`: images/screenshots.
-- `90_memory/people/`: one file per person (contacts + context).
-- `90_memory/people/_index.md`: a quick index of people for fast lookup.
-- `90_memory/recipes.md`: ALL recipes live here (do not create per-recipe files by default).
-- `99_process/`: process docs, templates, assistant change log.
-- `system/`: future runtime code/config (do not touch unless user explicitly asks).
-- `.agents/skills/`: Codex skills for this repo (do not touch unless user explicitly asks).
+- `00_inbox/`: сырье (1 сообщение/файл = 1 элемент). Не удалять. Почти не переименовывать.
+- `01_capture/daily/`: дневник `YYYY-MM-DD.md` (главная лента событий).
+- `01_capture/transcripts/`: длинные транскрипты (голосовые/созвоны), если в daily слишком много.
+- `01_capture/notes/`: редкие длинные конспекты/заметки (конференции, лонгриды).
+- `01_capture/read_later.md`: единый список "прочитать/посмотреть позже".
+- `02_distill/`: опциональные выжимки (только по явной просьбе).
+- `04_projects/`: папки проектов (только когда это реально "долгоиграющее").
+- `04_projects/_index.md`: краткий список активных проектов.
+- `88_files/`: документы (pdf/doc/zip/etc), по возможности сохранять исходные имена.
+- `89_images/`: картинки/скриншоты.
+- `90_memory/people/`: 1 файл на человека (контакты + контекст).
+- `90_memory/people/_index.md`: быстрый индекс людей.
+- `90_memory/recipes.md`: все рецепты здесь (без отдельных файлов на рецепт по умолчанию).
+- `99_process/`: процессы, шаблоны, журнал изменений ассистента.
+- `system/`: исполняемая часть (не трогать без явного запроса).
+- `.agents/skills/`: project skills (не трогать без явного запроса).
 
-## Default Workflow (Intake)
+## Базовый поток (интейк)
 
-For each new incoming item:
+Для каждого нового входящего:
 
-1. Always append an entry to today's daily file: `01_capture/daily/YYYY-MM-DD.md`.
-2. Keep the entry short: what it is, why it matters, where the raw is (`00_inbox/...`) and any link/file path.
-3. If it matches a long-lived category, ALSO update the corresponding place:
-   - A "read later" link -> `01_capture/read_later.md`
-   - A person's contact/info -> `90_memory/people/<person>.md` and `90_memory/people/_index.md`
-   - A recipe -> `90_memory/recipes.md`
-   - An ongoing work item -> `04_projects/<project>/...` (only if it is truly ongoing)
+1. Всегда добавь запись в `01_capture/daily/YYYY-MM-DD.md`.
+2. Запись короткая: что это, зачем, где сырье (`00_inbox/...`) и ссылка/путь на вложение.
+3. Если это "долгоживущая" сущность, дополнительно обнови:
+   - "прочитать позже" -> `01_capture/read_later.md`
+   - контакт/инфа о человеке -> `90_memory/people/<person>.md` + `90_memory/people/_index.md`
+   - рецепт -> `90_memory/recipes.md`
+   - проект -> `04_projects/<project>/...` (только если явно нужно и это не разовая заметка)
 
-## File Creation Rules (Anti-Sprawl)
+## Правила создания файлов (анти-хаос)
 
-The main risk is "100500 folders/files". Avoid it with these rules:
+Главный риск — "100500 папок/файлов". Поэтому:
 
-- Prefer adding to existing files over creating new files.
-- Do not create new directories unless they already exist above.
-- Keep directory depth <= 2 levels from repo root (exception: inside a project folder in `04_projects/`).
-- New Markdown files are allowed only for:
-  - `90_memory/people/<person>.md` (one per person)
-  - a new project folder under `04_projects/` (when needed)
-  - long transcripts/notes under `01_capture/transcripts/` or `01_capture/notes/`
-  - process/templates under `99_process/` (rare)
-- If you are unsure where something belongs, put it ONLY into the daily note and ask 1 clarifying question.
+- Предпочитай дописывать в существующие файлы, а не создавать новые.
+- Не создавай новые директории, кроме уже существующих в структуре.
+- Глубина папок: максимум 2 уровня от корня (исключение: внутри `04_projects/<project>/`).
+- Новые `md` допускаются только для:
+  - нового человека в `90_memory/people/<person>.md`
+  - нового проекта в `04_projects/` (по необходимости / по запросу)
+  - длинного текста в `01_capture/transcripts/` или `01_capture/notes/`
+  - процессных файлов в `99_process/` (редко)
+- Если не уверен, куда это класть: записывай только в daily и задай 1 уточняющий вопрос.
 
-## Daily Notes Format
+## Формат daily
 
-Daily file: `01_capture/daily/YYYY-MM-DD.md`
+Файл дня: `01_capture/daily/YYYY-MM-DD.md`
 
-For each entry, include:
+На каждую запись:
 
-- Short title (1 line)
-- Context (source: Telegram / web / etc)
-- Links/paths (to inbox item or attachment)
-- Optional: "Next step" (if the user asked for action)
+- Короткий заголовок (1 строка)
+- Контекст (источник: Telegram / web / etc)
+- Ссылки/пути (на `00_inbox/` и/или вложения)
+- Опционально: "следующий шаг" (если пользователь просил действие)
 
-## Long Voice Transcripts / Dumps
+## Длинные голосовые / дампы текста
 
-If the incoming text is long (roughly > 2000-3000 words):
+Если текста много (примерно > 2000-3000 слов):
 
-- Save the full text to `01_capture/transcripts/YYYY-MM-DD-<short-slug>.md`.
-- In the daily file, store:
-  - a 5-10 line summary
-  - a link to the transcript file
-  - any extracted long-lived facts (people, read-later links, etc)
+- Полный текст в `01_capture/transcripts/YYYY-MM-DD-<slug>.md`
+- В daily:
+  - резюме 5-10 строк
+  - ссылка на транскрипт
+  - извлеченные факты (контакты, ссылки "на потом", и т.п.)
 
-## Search & Retrieval (Answering Questions)
+## Поиск и ответы
 
-- Prefer simple search first: filenames, headings, `rg` keyword search.
-- Check these first for retrieval tasks:
+- Сначала простой поиск: названия файлов, заголовки, `rg` по ключевым словам.
+- Для быстрых ответов сначала смотреть:
   - `90_memory/people/_index.md`
   - `01_capture/read_later.md`
-  - `04_projects/_index.md` (if present)
-  - recent daily files
-- When returning answers, include the relevant file paths so the user can open the source.
+  - `04_projects/_index.md`
+  - последние daily-файлы
+- В ответе указывать пути к файлам-источникам.
 
-## Maintenance Mode (Self-Modification)
+## Режим обслуживания (саморедактирование)
 
-Do NOT edit `system/`, `.agents/skills/`, or `AGENTS.md` unless the user explicitly asks to.
-When you do make changes to those areas, append a short entry to `99_process/assistant_changelog.md`.
-
+Не правь `system/`, `.agents/skills/` и `AGENTS.md`, если пользователь явно этого не попросил.
+Если правки были, добавь короткую запись в `99_process/assistant_changelog.md`.
