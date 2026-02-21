@@ -1,9 +1,38 @@
 # System
 
-Эта папка для "исполняемой" части (Telegram-бот, очередь задач, сервисы, БД и т.п.).
+Эта папка содержит исполняемую часть: Telegram-бот, очередь задач, локальные БД и runbook-и.
 
-Принцип:
+## Что уже есть
 
-- Данные и заметки живут в корне vault (папки `00_inbox/`, `01_capture/`, `90_memory/` и т.д.).
-- `system/` можно переносить вместе с vault, но секреты хранить отдельно (`system/secrets/` в `.gitignore`).
+- `system/bot/main.py`: long-polling Telegram-бот.
+- `system/bot/queue_store.py`: очередь задач на SQLite (`system/tasks/bot_state.db`).
+- `system/bot/worker.py`: запуск `codex exec` и отправка результата обратно в Telegram.
+- `system/runbooks/bootstrap.sh`: подготовка окружения.
+- `system/runbooks/run_bot.sh`: запуск бота.
+- `system/runbooks/systemd/personal-assistant-bot.service`: шаблон unit-файла.
 
+## Быстрый запуск
+
+1. Перейти в корень проекта.
+2. Выполнить `bash system/runbooks/bootstrap.sh`.
+3. Заполнить `system/bot/.env` (минимум `TG_BOT_TOKEN`, желательно `TG_ALLOWED_USER_IDS`).
+4. Запустить `bash system/runbooks/run_bot.sh`.
+
+## Секреты и переносимость
+
+- Данные vault и runtime лежат в одном проекте, перенос делается копированием всей папки.
+- Секреты не коммитятся (`system/bot/.env`, `system/secrets/` в `.gitignore`).
+
+## CI/CD
+
+- CI: `.github/workflows/ci.yml` (compile + unit tests).
+- CD: `.github/workflows/cd.yml` (rsync + remote bootstrap + restart service).
+
+Нужные секреты для CD:
+
+- `DEPLOY_HOST`
+- `DEPLOY_PORT` (опционально, по умолчанию `22`)
+- `DEPLOY_USER`
+- `DEPLOY_PATH`
+- `DEPLOY_SSH_KEY`
+- `DEPLOY_SERVICE` (опционально: имя systemd service для рестарта)

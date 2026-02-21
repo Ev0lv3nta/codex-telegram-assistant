@@ -1,0 +1,62 @@
+name: cd
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    if: ${{ secrets.DEPLOY_HOST != '' && secrets.DEPLOY_USER != '' && secrets.DEPLOY_SSH_KEY != '' && secrets.DEPLOY_PATH != '' }}
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf "%s" "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync project
+        run: |
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude ".venv" \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Remote bootstrap and restart
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "DEPLOY_PATH='$DEPLOY_PATH' DEPLOY_SERVICE='${DEPLOY_SERVICE:-}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          if [ ! -d .venv ]; then
+            python3 -m venv .venv
+          fi
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r system/bot/requirements.txt
+
+          if [ -n "${DEPLOY_SERVICE:-}" ]; then
+            if systemctl --user status "$DEPLOY_SERVICE" >/dev/null 2>&1; then
+              systemctl --user restart "$DEPLOY_SERVICE"
+            elif command -v sudo >/dev/null 2>&1 && sudo -n systemctl status "$DEPLOY_SERVICE" >/dev/null 2>&1; then
+              sudo -n systemctl restart "$DEPLOY_SERVICE"
+            else
+              echo "Service restart skipped: no access to systemctl for $DEPLOY_SERVICE"
+            fi
+          else
+            echo "DEPLOY_SERVICE is empty, skip service restart."
+          fi
+          REMOTE

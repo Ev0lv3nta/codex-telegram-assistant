@@ -9,4 +9,8 @@ system/secrets/
 system/tmp/
 system/logs/
 system/.env
-
+system/bot/.env
+.venv/
+__pycache__/
+system/tasks/*.db
+system/runbooks/bot.pid

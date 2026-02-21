@@ -1,0 +1,15 @@
+[Unit]
+Description=Personal Assistant Telegram Bot (Codex CLI)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/personal-assistant
+EnvironmentFile=/opt/personal-assistant/system/bot/.env
+ExecStart=/opt/personal-assistant/.venv/bin/python -m system.bot.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
