@@ -19,11 +19,17 @@ class CodexRunner:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def run(self, prompt: str) -> CodexRunResult:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            output_path = Path(tmp_dir) / "last_message.txt"
-            command = [
-                self._settings.codex_bin,
+    @staticmethod
+    def _supports_top_level_search(stderr: str) -> bool:
+        return "unexpected argument '--search'" not in stderr
+
+    def _build_command(self, prompt: str, output_path: Path, include_search: bool) -> list[str]:
+        command = [self._settings.codex_bin]
+        # In some Codex CLI versions --search is a top-level flag, not an `exec` flag.
+        if include_search and self._settings.codex_search_enabled:
+            command.append("--search")
+        command.extend(
+            [
                 "exec",
                 "--skip-git-repo-check",
                 "--cd",
@@ -31,22 +37,38 @@ class CodexRunner:
                 "--output-last-message",
                 str(output_path),
             ]
-            if self._settings.codex_search_enabled:
-                command.append("--search")
-            if self._settings.codex_model:
-                command.extend(["-m", self._settings.codex_model])
-            if self._settings.codex_extra_args:
-                command.extend(shlex.split(self._settings.codex_extra_args))
-            command.append(prompt)
+        )
+        if self._settings.codex_model:
+            command.extend(["-m", self._settings.codex_model])
+        if self._settings.codex_extra_args:
+            command.extend(shlex.split(self._settings.codex_extra_args))
+        command.append(prompt)
+        return command
 
+    def _run_once(self, command: list[str], timeout_sec: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            cwd=self._settings.assistant_root,
+        )
+
+    def run(self, prompt: str) -> CodexRunResult:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "last_message.txt"
             try:
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=self._settings.codex_timeout_sec,
-                    cwd=self._settings.assistant_root,
-                )
+                command = self._build_command(prompt, output_path, include_search=True)
+                completed = self._run_once(command, self._settings.codex_timeout_sec)
+                if completed.returncode != 0 and not self._supports_top_level_search(
+                    completed.stderr or ""
+                ):
+                    fallback_command = self._build_command(
+                        prompt, output_path, include_search=False
+                    )
+                    completed = self._run_once(
+                        fallback_command, self._settings.codex_timeout_sec
+                    )
             except FileNotFoundError:
                 return CodexRunResult(False, "Failed to run codex: binary not found")
             except subprocess.TimeoutExpired:
@@ -65,4 +87,3 @@ class CodexRunner:
             if completed.returncode != 0:
                 return CodexRunResult(False, message)
             return CodexRunResult(True, message)
-
