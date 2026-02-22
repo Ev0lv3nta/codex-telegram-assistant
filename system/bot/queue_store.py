@@ -186,6 +186,17 @@ class QueueStore:
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM meta WHERE key = ?", (f"chat_session:{chat_id}",))
 
+    def list_chat_session_ids(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT value FROM meta WHERE key LIKE 'chat_session:%'"
+        ).fetchall()
+        result: set[str] = set()
+        for row in rows:
+            value = str(row["value"] or "").strip()
+            if value:
+                result.add(value)
+        return result
+
     def counts(self) -> dict[str, int]:
         rows = self._conn.execute(
             """

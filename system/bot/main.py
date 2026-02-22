@@ -5,6 +5,7 @@ import signal
 import time
 import traceback
 import threading
+from pathlib import Path
 
 from .classifier import Mode
 from .codex_runner import CodexRunner
@@ -12,6 +13,7 @@ from .config import Settings
 from .git_ops import GitOps
 from .ingest import download_attachments
 from .queue_store import QueueStore
+from .session_gc import gc_sessions
 from .telegram_api import TelegramAPI, TelegramAPIError
 from .worker import Worker
 
@@ -34,6 +36,7 @@ HELP_TEXT = """
 - Можно прикладывать файлы/фото/голосовые.
 - `/status` показывает состояние очереди.
 - `/reset` сбрасывает сессию чата (начать новый контекст).
+- `/gc [days]` чистит старые Codex-сессии на диске (по умолчанию 7 дней).
 
 Это прямой шлюз в Codex CLI: обычные сообщения обрабатываются как чат,
 а изменения файлов/кода делаются по явной просьбе.
@@ -108,6 +111,31 @@ def _handle_message(
     if text == "/reset":
         store.clear_chat_session_id(chat_id)
         api.send_message(chat_id, "Сессия этого чата сброшена. Следующее сообщение начнет новый контекст.")
+        return
+
+    if text.strip().lower().startswith("/gc"):
+        parts = text.strip().split(maxsplit=1)
+        days = 7
+        if len(parts) == 2:
+            try:
+                days = int(parts[1].strip())
+            except ValueError:
+                api.send_message(chat_id, "Использование: /gc [days]  (пример: /gc 30)")
+                return
+
+        keep = store.list_chat_session_ids()
+        sessions_dir = Path("/root/.codex/sessions")
+        result = gc_sessions(sessions_dir=sessions_dir, keep_session_ids=keep, older_than_days=days)
+        api.send_message(
+            chat_id,
+            (
+                "GC Codex sessions:\n"
+                f"- deleted: {result.deleted_files}\n"
+                f"- kept(active): {result.kept_files}\n"
+                f"- skipped(recent): {result.skipped_files}\n"
+                f"- errors: {result.errors}"
+            ),
+        )
         return
 
     if text.strip().lower().startswith("/mode"):

@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from .classifier import Mode
 
+AGENTS_MD_PATH = "/root/personal-assistant/AGENTS.md"
+
 
 def _attachments_block(attachments: list[str]) -> str:
     if not attachments:
-        return "(нет вложений)"
+        return ""
     lines = [f"- `{item}`" for item in attachments]
     return "\n".join(lines)
+
+
+def _bootstrap_prefix(include_bootstrap: bool) -> str:
+    if not include_bootstrap:
+        return ""
+    return (
+        "Перед выполнением запроса открой и прочитай файл "
+        f"`{AGENTS_MD_PATH}`. Следуй ему как основным инструкциям этой сессии.\n\n"
+    )
 
 
 def build_prompt(
@@ -15,24 +26,26 @@ def build_prompt(
     user_text: str,
     inbox_path: str,
     attachments: list[str],
+    include_bootstrap: bool = False,
 ) -> str:
-    return f"""
-Ты личный ассистент в Telegram. Запрос приходит через шлюз в Codex CLI.
+    _ = mode, inbox_path
+    text = (user_text or "").strip()
+    attachment_block = _attachments_block(attachments)
+    prefix = _bootstrap_prefix(include_bootstrap)
 
-Рабочая директория: `/root/personal-assistant`
-Служебный режим очереди: `{mode.value}`
-Путь inbox (может быть пустым): `{inbox_path or "(пусто)"}`
-Вложения (уже сохранены на сервере):
-{_attachments_block(attachments)}
+    if text and not attachments:
+        return f"{prefix}{text}"
 
-Запрос пользователя:
-\"\"\"{user_text}\"\"\"
+    if text and attachments:
+        return (
+            f"{prefix}{text}\n\n"
+            "Вложения пользователя (пути на сервере):\n"
+            f"{attachment_block}"
+        )
 
-Правила:
-- По умолчанию это обычный разговор. Отвечай естественно и кратко.
-- Не меняй файлы и не запускай команды, если пользователь явно этого не просил.
-- Если пользователь явно просит что-то сделать в системе (изменить файл, написать код, поискать в интернете, сохранить данные), выполни это.
-- Не показывай внутреннюю кухню: команды, шаги, служебные рассуждения.
-- Если реально менял файлы, в конце добавь блок `Изменено:` с путями.
-- Если данных не хватает, задай один короткий уточняющий вопрос.
-""".strip()
+    return (
+        f"{prefix}"
+        "Пользователь отправил вложения без текста.\n"
+        "Вложения пользователя (пути на сервере):\n"
+        f"{attachment_block}"
+    )

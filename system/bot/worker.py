@@ -55,13 +55,14 @@ class Worker(threading.Thread):
             mode = Mode.AUTO
 
         self._logger.info("Processing task #%s in mode=%s", task.id, mode.value)
+        chat_session_id = self._store.get_chat_session_id(task.chat_id)
         prompt = build_prompt(
             mode=mode,
             user_text=task.text,
             inbox_path=task.inbox_path,
             attachments=task.attachments,
+            include_bootstrap=not bool(chat_session_id),
         )
-        chat_session_id = self._store.get_chat_session_id(task.chat_id)
         try:
             self._api.send_chat_action(task.chat_id, "typing")
         except Exception:  # pragma: no cover
