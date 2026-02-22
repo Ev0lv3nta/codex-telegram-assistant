@@ -28,6 +28,7 @@
 2. Ставит задачу в очередь SQLite.
 3. Worker вызывает `codex exec` для новой сессии или `codex exec resume <session_id>` для продолжения.
 4. Ответ отправляется обратно в Telegram.
+5. Если в ответе модели есть строки вида `[[send-file:relative/path]]`, бот отправит указанные файлы как документы.
 
 ## Настройка
 
@@ -36,3 +37,20 @@
 - `TG_ALLOWED_USER_IDS=...`
 
 Модель/effort задаются через `CODEX_MODEL` и `CODEX_EXTRA_ARGS`.
+
+### Voice -> Text (OpenRouter STT)
+
+Бот поддерживает транскрибацию голосовых сообщений через OpenRouter (модель по умолчанию:
+`mistralai/voxtral-small-24b-2507`).
+
+Нужные переменные:
+- `OPENROUTER_API_KEY`
+- `OPENROUTER_BASE_URL` (по умолчанию `https://openrouter.ai/api/v1`)
+- `OPENROUTER_STT_MODEL`
+- `OPENROUTER_STT_TIMEOUT_SEC`
+- `OPENROUTER_STT_MAX_AUDIO_BYTES`
+
+Поведение:
+- Если приходит голосовое без текста, бот пытается распознать речь и подставляет результат как обычный текст запроса.
+- Если STT не сработал, бот отправляет пользователю сообщение об ошибке вида
+  `Голосовое не обработано: ...` и продолжает работать для остальных сообщений.

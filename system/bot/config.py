@@ -35,6 +35,12 @@ class Settings:
     codex_model: str
     codex_extra_args: str
     max_result_chars: int
+    max_send_file_bytes: int
+    openrouter_api_key: str
+    openrouter_base_url: str
+    openrouter_stt_model: str
+    openrouter_stt_timeout_sec: int
+    openrouter_stt_max_audio_bytes: int
     state_db_path: Path
     log_level: str
 
@@ -68,6 +74,12 @@ class Settings:
             codex_model=os.getenv("CODEX_MODEL", "").strip(),
             codex_extra_args=os.getenv("CODEX_EXTRA_ARGS", "").strip(),
             max_result_chars=_parse_int(os.getenv("BOT_MAX_RESULT_CHARS"), 3500),
+            max_send_file_bytes=_parse_int(os.getenv("BOT_MAX_SEND_FILE_BYTES"), 50 * 1024 * 1024),
+            openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+            openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip(),
+            openrouter_stt_model=os.getenv("OPENROUTER_STT_MODEL", "mistralai/voxtral-small-24b-2507").strip(),
+            openrouter_stt_timeout_sec=_parse_int(os.getenv("OPENROUTER_STT_TIMEOUT_SEC"), 90),
+            openrouter_stt_max_audio_bytes=_parse_int(os.getenv("OPENROUTER_STT_MAX_AUDIO_BYTES"), 25 * 1024 * 1024),
             state_db_path=state_db,
             log_level=os.getenv("BOT_LOG_LEVEL", "INFO").upper(),
         )

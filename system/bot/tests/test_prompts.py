@@ -9,7 +9,9 @@ class PromptTests(unittest.TestCase):
             user_text="Поищи лучшие источники",
             attachments=[],
         )
-        self.assertEqual(prompt, "Поищи лучшие источники")
+        self.assertIn("Поищи лучшие источники", prompt)
+        self.assertIn("[[send-file:", prompt)
+        self.assertIn("сначала запроси у пользователя явное подтверждение", prompt)
 
     def test_prompt_has_bootstrap_prefix_for_new_session(self) -> None:
         prompt = build_prompt(
@@ -19,6 +21,8 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("AGENTS.md", prompt)
         self.assertIn("Привет", prompt)
+        self.assertIn("[[send-file:", prompt)
+        self.assertIn("сначала запроси у пользователя явное подтверждение", prompt)
 
     def test_prompt_includes_attachment_paths(self) -> None:
         prompt = build_prompt(
@@ -27,6 +31,8 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("Где контакт Ивана?", prompt)
         self.assertIn("88_files/file.pdf", prompt)
+        self.assertIn("[[send-file:", prompt)
+        self.assertIn("сначала запроси у пользователя явное подтверждение", prompt)
 
     def test_prompt_for_attachments_without_text(self) -> None:
         prompt = build_prompt(
@@ -35,6 +41,8 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("без текста", prompt)
         self.assertIn("89_images/pic.jpg", prompt)
+        self.assertIn("[[send-file:", prompt)
+        self.assertIn("сначала запроси у пользователя явное подтверждение", prompt)
 
 
 if __name__ == "__main__":

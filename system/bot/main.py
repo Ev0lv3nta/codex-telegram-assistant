@@ -13,6 +13,7 @@ from .config import Settings
 from .ingest import download_attachments
 from .queue_store import QueueStore
 from .session_gc import gc_sessions
+from .stt_openrouter import OpenRouterSttClient
 from .worker import Worker
 
 
@@ -52,6 +53,69 @@ def _extract_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
 
 
+def _pick_audio_attachment(assistant_root: Path, attachments: list[str]) -> Path | None:
+    audio_suffixes = {".ogg", ".oga", ".opus", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
+    for rel_path in attachments:
+        candidate = (assistant_root / rel_path).resolve()
+        if candidate.suffix.lower() not in audio_suffixes:
+            continue
+        try:
+            candidate.relative_to(assistant_root)
+        except ValueError:
+            continue
+        return candidate
+    return None
+
+
+async def _transcribe_voice_if_needed(
+    message: Message,
+    settings: Settings,
+    stt_client: OpenRouterSttClient,
+    text: str,
+    attachments: list[str],
+) -> tuple[str, str, str | None]:
+    if message.voice is None and message.audio is None:
+        return text, "", None
+    if not attachments:
+        return text, "Голосовое не обработано: вложение не найдено.", None
+
+    audio_path = _pick_audio_attachment(settings.assistant_root, attachments)
+    if audio_path is None:
+        return text, "Голосовое не обработано: не найден поддерживаемый аудиофайл.", None
+    audio_rel_path = audio_path.relative_to(settings.assistant_root).as_posix()
+
+    duration_sec = 0
+    if message.voice is not None and getattr(message.voice, "duration", None):
+        duration_sec = int(message.voice.duration)
+    elif message.audio is not None and getattr(message.audio, "duration", None):
+        duration_sec = int(message.audio.duration)
+
+    result = await asyncio.to_thread(stt_client.transcribe_file, audio_path, duration_sec)
+    if result.success and result.text:
+        transcript = result.text.strip()
+        if text:
+            merged_text = f"{text}\n\n[Расшифровка голосового]\n{transcript}"
+            return merged_text, "", audio_rel_path
+        return transcript, "", audio_rel_path
+
+    if text:
+        return text, f"Голосовое не обработано: {result.error or 'неизвестная ошибка.'}", audio_rel_path
+    return "", f"Голосовое не обработано: {result.error or 'неизвестная ошибка.'}", audio_rel_path
+
+
+def _delete_attachment_file(assistant_root: Path, rel_path: str) -> None:
+    file_path = (assistant_root / rel_path).resolve()
+    try:
+        file_path.relative_to(assistant_root)
+    except ValueError:
+        LOGGER.warning("Skip deleting file outside assistant root: %s", rel_path)
+        return
+    try:
+        file_path.unlink(missing_ok=True)
+    except OSError as exc:
+        LOGGER.warning("Failed to delete processed attachment %s: %s", rel_path, exc)
+
+
 def _render_status(store: QueueStore, chat_id: int) -> str:
     counts = store.counts()
     session_id = store.get_chat_session_id(chat_id) or "(нет)"
@@ -75,7 +139,12 @@ def _parse_gc_days(text: str) -> int | None:
         return None
 
 
-def _build_dispatcher(settings: Settings, store: QueueStore, bot: Bot) -> Dispatcher:
+def _build_dispatcher(
+    settings: Settings,
+    store: QueueStore,
+    bot: Bot,
+    stt_client: OpenRouterSttClient,
+) -> Dispatcher:
     dp = Dispatcher()
 
     async def _guard(message: Message) -> bool:
@@ -156,6 +225,27 @@ def _build_dispatcher(settings: Settings, store: QueueStore, bot: Bot) -> Dispat
 
         text = _extract_text(message)
         attachments = await download_attachments(bot, settings.assistant_root, message)
+        text, voice_error, transcribed_audio_rel_path = await _transcribe_voice_if_needed(
+            message=message,
+            settings=settings,
+            stt_client=stt_client,
+            text=text,
+            attachments=attachments,
+        )
+        if message.voice is not None and transcribed_audio_rel_path:
+            _delete_attachment_file(settings.assistant_root, transcribed_audio_rel_path)
+            attachments = [item for item in attachments if item != transcribed_audio_rel_path]
+
+        if voice_error:
+            await message.answer(voice_error)
+            LOGGER.warning(
+                "Voice transcription failed for chat=%s user=%s: %s",
+                chat_id,
+                user_id,
+                voice_error,
+            )
+            if not text:
+                return
         if not text and not attachments:
             return
 
@@ -180,6 +270,7 @@ async def _run_async() -> None:
     store = QueueStore(settings.state_db_path)
     bot = Bot(token=settings.telegram_token)
     runner = CodexRunner(settings)
+    stt_client = OpenRouterSttClient(settings)
     stop_event = asyncio.Event()
     worker = Worker(
         settings=settings,
@@ -189,7 +280,7 @@ async def _run_async() -> None:
         stop_event=stop_event,
     )
     worker_task = asyncio.create_task(worker.run())
-    dispatcher = _build_dispatcher(settings, store, bot)
+    dispatcher = _build_dispatcher(settings, store, bot, stt_client)
 
     try:
         await dispatcher.start_polling(

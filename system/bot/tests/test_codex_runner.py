@@ -41,6 +41,10 @@ class CodexRunnerParseTests(unittest.TestCase):
         self.assertIn("state db missing rollout path", message)
         self.assertNotIn("internal details", message)
 
+    def test_success_text_has_human_fallback(self) -> None:
+        message = CodexRunner._success_text(parsed_message="", stdout="")
+        self.assertIn("модель не вернула текстовый ответ", message)
+
 
 if __name__ == "__main__":
     unittest.main()

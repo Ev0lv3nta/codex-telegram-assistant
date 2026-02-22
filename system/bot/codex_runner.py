@@ -118,7 +118,10 @@ class CodexRunner:
         lines = cls._non_json_lines(stdout)
         if lines:
             return "\n".join(lines[:6])
-        return "(empty Codex response)"
+        return (
+            "Запрос выполнен, но модель не вернула текстовый ответ. "
+            "Если нужно, повтори запрос или сбрось контекст командой /reset."
+        )
 
     def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
         try:

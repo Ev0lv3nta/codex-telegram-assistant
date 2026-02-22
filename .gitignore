@@ -14,3 +14,10 @@ system/bot/.env
 __pycache__/
 system/tasks/*.db
 system/runbooks/bot.pid
+
+# User/runtime artifacts
+88_files/
+89_images/
+html_responses/
+daily/
+topics/

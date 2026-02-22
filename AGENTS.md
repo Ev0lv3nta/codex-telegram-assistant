@@ -25,6 +25,40 @@
 - Вложения из Telegram:
   - `88_files/` документы
   - `89_images/` изображения
+- HTML-ответы:
+  - `html_responses/last-response.html` (единый файл для перезаписи)
+
+## Отправка файлов в Telegram
+
+- Бот умеет отправлять файлы пользователю как документы.
+- Чтобы отправить файл, в КОНЕЦ ответа добавь отдельные строки формата:
+  - `[[send-file:daily/2026-02-22.md]]`
+  - `[[send-file:topics/note.md]]`
+- Каждый путь указывай отдельной строкой, только путь на сервере.
+- Эти строки не оборачивай в код-блок.
+
+## HTML-ответы
+
+- Если пользователь просит ответ в HTML-файле:
+  1. используй файл `html_responses/last-response.html`;
+  2. полностью перезапиши файл (очисти старое содержимое);
+  3. запиши новый ответ в аккуратном минималистичном HTML (`<!doctype html>`, `meta charset`, `meta viewport`, читаемая типографика, отступы);
+  4. отправь этот файл пользователю через `[[send-file:html_responses/last-response.html]]`.
+- Если пользователь явно не просил HTML-файл, отвечай обычным текстом.
+
+## Границы: бот vs Codex CLI
+
+- **"Моё" (Telegram-бот / шлюз в этом репозитории)**:
+  - Код: `/root/personal-assistant/system/bot/`
+  - Настройки модели/effort для бота: `/root/personal-assistant/system/bot/.env` (`CODEX_MODEL`, `CODEX_EXTRA_ARGS`)
+  - Состояние/очередь: `/root/personal-assistant/system/tasks/bot_state.db`
+  - Сервис: `personal-assistant-bot.service`
+- **"Не моё" (глобальная конфигурация Codex CLI на сервере)**:
+  - Глобальные дефолты Codex CLI: `/root/.codex/config.toml`
+  - Кэш/сессии Codex CLI: `/root/.codex/…`
+- **Правило по умолчанию**:
+  - Если пользователь просит поменять "себя"/настройки бота/модель/effort — меняю только `system/bot/.env` и/или код в `system/bot/`.
+  - Ничего в `/root/.codex/*` не меняю, пока пользователь явно не попросит про "глобальные настройки Codex CLI".
 
 ## Сервис бота
 
