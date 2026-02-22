@@ -52,7 +52,7 @@ class Worker(threading.Thread):
         try:
             mode = Mode(task.mode)
         except ValueError:
-            mode = Mode.INTAKE
+            mode = Mode.AUTO
 
         self._logger.info("Processing task #%s in mode=%s", task.id, mode.value)
         prompt = build_prompt(
@@ -70,18 +70,20 @@ class Worker(threading.Thread):
         if result.success:
             commit_note = self._git_ops.commit_if_needed(mode.value, task.id)
             push_note = self._git_ops.push_if_due(self._store)
-            final_text = (
-                f"Task #{task.id} completed.\n\n"
-                f"{result.message.strip()}\n\n"
-                f"Git:\n- {commit_note}\n- {push_note}"
+            self._logger.info(
+                "Task #%s git ops: commit='%s' push='%s'",
+                task.id,
+                commit_note,
+                push_note,
             )
+            final_text = result.message.strip()
             final_text = _trim(final_text, self._settings.max_result_chars)
             self._store.complete_task(task.id, final_text)
             self._safe_send(task.chat_id, final_text)
             return
 
         error_text = _trim(
-            f"Task #{task.id} failed.\n\n{result.message}",
+            f"Не удалось выполнить задачу #{task.id}.\n\n{result.message}",
             self._settings.max_result_chars,
         )
         self._store.fail_task(task.id, error_text)
@@ -92,4 +94,3 @@ class Worker(threading.Thread):
             self._api.send_message(chat_id, text)
         except Exception as exc:  # pragma: no cover
             self._logger.error("Failed to send message to chat %s: %s", chat_id, exc)
-

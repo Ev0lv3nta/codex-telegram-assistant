@@ -29,10 +29,15 @@ class ClassifierTests(unittest.TestCase):
             Mode.ANSWER,
         )
 
+    def test_classify_answer_question_mark_in_middle(self) -> None:
+        self.assertEqual(
+            classify_text("Как ты работаешь? В общих чертах простыми словами"),
+            Mode.ANSWER,
+        )
+
     def test_classify_default(self) -> None:
         self.assertEqual(classify_text("Сохрани мою заметку про сегодня"), Mode.INTAKE)
 
 
 if __name__ == "__main__":
     unittest.main()
-

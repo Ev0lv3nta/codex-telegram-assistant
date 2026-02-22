@@ -40,7 +40,6 @@ class Settings:
     codex_bin: str
     codex_timeout_sec: int
     codex_model: str
-    codex_search_enabled: bool
     codex_extra_args: str
     auto_commit: bool
     auto_push: bool
@@ -79,9 +78,6 @@ class Settings:
             codex_bin=os.getenv("CODEX_BIN", "codex"),
             codex_timeout_sec=_parse_int(os.getenv("CODEX_TIMEOUT_SEC"), 1800),
             codex_model=os.getenv("CODEX_MODEL", "").strip(),
-            codex_search_enabled=_parse_bool(
-                os.getenv("CODEX_ENABLE_SEARCH"), True
-            ),
             codex_extra_args=os.getenv("CODEX_EXTRA_ARGS", "").strip(),
             auto_commit=_parse_bool(os.getenv("BOT_AUTO_COMMIT"), True),
             auto_push=_parse_bool(os.getenv("BOT_AUTO_PUSH"), True),
@@ -94,4 +90,3 @@ class Settings:
             state_db_path=state_db,
             log_level=os.getenv("BOT_LOG_LEVEL", "INFO").upper(),
         )
-

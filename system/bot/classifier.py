@@ -120,7 +120,7 @@ def classify_text(text: str) -> Mode:
     if any(token in normalized for token in RESEARCH_KEYWORDS):
         return Mode.RESEARCH
 
-    if normalized.endswith("?") or any(
+    if "?" in normalized or "？" in normalized or any(
         token in normalized for token in ANSWER_KEYWORDS
     ):
         return Mode.ANSWER
@@ -145,4 +145,3 @@ def keyboard_markup() -> dict:
         "resize_keyboard": True,
         "is_persistent": True,
     }
-

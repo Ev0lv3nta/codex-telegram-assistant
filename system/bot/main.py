@@ -7,14 +7,7 @@ import time
 import traceback
 import threading
 
-from .classifier import (
-    BUTTON_LABELS,
-    Mode,
-    classify_text,
-    keyboard_markup,
-    mode_from_label,
-    parse_mode_command,
-)
+from .classifier import Mode
 from .codex_runner import CodexRunner
 from .config import Settings
 from .git_ops import GitOps
@@ -25,14 +18,21 @@ from .worker import Worker
 
 
 LOGGER = logging.getLogger("assistant.main")
+LEGACY_MODE_BUTTONS = {
+    "Авто",
+    "Интейк",
+    "Исследование",
+    "Ответ",
+    "Финансы",
+    "Обслуживание",
+}
 
 HELP_TEXT = """
 Ассистент подключен.
 
 Как пользоваться:
-- Пиши свободным текстом: бот сам определит режим.
-- Кнопки меняют режим по умолчанию для чата.
-- `/mode auto|intake|research|answer|finance|maintenance` меняет режим.
+- Пиши свободным текстом, как обычному личному ассистенту.
+- Можно прикладывать файлы/фото/голосовые.
 - `/status` показывает состояние очереди.
 
 Все входящие сначала сохраняются в `00_inbox`, затем обрабатываются через Codex CLI.
@@ -44,13 +44,6 @@ def _setup_logging(level: str) -> None:
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-
-
-def _safe_mode(mode_value: str) -> Mode:
-    try:
-        return Mode(mode_value)
-    except ValueError:
-        return Mode.AUTO
 
 
 def _is_authorized(settings: Settings, chat_id: int, user_id: int) -> bool:
@@ -67,23 +60,13 @@ def _extract_text(message: dict) -> str:
 
 def _render_status(store: QueueStore, chat_id: int) -> str:
     counts = store.counts()
-    mode = _safe_mode(store.get_chat_mode(chat_id))
-    mode_label = BUTTON_LABELS[mode]
     return (
         "Состояние бота:\n"
-        f"- mode: {mode.value} ({mode_label})\n"
         f"- pending: {counts['pending']}\n"
         f"- running: {counts['running']}\n"
         f"- done: {counts['done']}\n"
         f"- failed: {counts['failed']}"
     )
-
-
-def _resolve_mode(store: QueueStore, chat_id: int, text: str) -> Mode:
-    chat_mode = _safe_mode(store.get_chat_mode(chat_id))
-    if chat_mode is not Mode.AUTO:
-        return chat_mode
-    return classify_text(text)
 
 
 def _handle_message(
@@ -112,30 +95,24 @@ def _handle_message(
     text = _extract_text(message)
 
     if text == "/start":
-        api.send_message(chat_id, HELP_TEXT, reply_markup=keyboard_markup())
+        api.send_message(chat_id, HELP_TEXT, reply_markup={"remove_keyboard": True})
         return
 
     if text == "/status":
         api.send_message(chat_id, _render_status(store, chat_id))
         return
 
-    command_mode = parse_mode_command(text)
-    if command_mode is not None:
-        store.set_chat_mode(chat_id, command_mode.value)
+    if text.strip().lower().startswith("/mode"):
         api.send_message(
             chat_id,
-            f"Режим по умолчанию: `{command_mode.value}` ({BUTTON_LABELS[command_mode]})",
-            reply_markup=keyboard_markup(),
+            "Режимы отключены. Просто пиши задачу свободным текстом.",
         )
         return
 
-    button_mode = mode_from_label(text)
-    if button_mode is not None:
-        store.set_chat_mode(chat_id, button_mode.value)
+    if text.strip() in LEGACY_MODE_BUTTONS:
         api.send_message(
             chat_id,
-            f"Режим переключен: `{button_mode.value}`",
-            reply_markup=keyboard_markup(),
+            "Кнопки режимов больше не используются. Просто напиши задачу текстом.",
         )
         return
 
@@ -143,7 +120,7 @@ def _handle_message(
     if not text and not attachments:
         return
 
-    effective_mode = _resolve_mode(store, chat_id, text)
+    effective_mode = Mode.AUTO
     inbox_path = write_inbox_markdown(
         assistant_root=settings.assistant_root,
         message=message,
@@ -165,10 +142,8 @@ def _handle_message(
     api.send_message(
         chat_id,
         (
-            f"Задача принята: #{task_id}\n"
-            f"- mode: `{effective_mode.value}`\n"
-            f"- inbox: `{inbox_path}`\n"
-            "Обрабатываю в очереди."
+            f"Принял задачу #{task_id}. "
+            "Обрабатываю."
         ),
     )
 
@@ -249,4 +224,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
