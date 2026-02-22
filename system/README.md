@@ -6,7 +6,7 @@
 
 - `system/bot/main.py`: long-polling Telegram-бот.
 - `system/bot/queue_store.py`: очередь задач на SQLite (`system/tasks/bot_state.db`).
-- `system/bot/worker.py`: запуск `codex exec` и отправка результата обратно в Telegram.
+- `system/bot/worker.py`: запуск `codex exec`/`codex exec resume` и отправка результата обратно в Telegram.
 - `system/runbooks/bootstrap.sh`: подготовка окружения.
 - `system/runbooks/run_bot.sh`: запуск бота.
 - `system/runbooks/systemd/personal-assistant-bot.service`: шаблон unit-файла.
@@ -20,7 +20,7 @@
 
 ## Секреты и переносимость
 
-- Данные vault и runtime лежат в одном проекте, перенос делается копированием всей папки.
+- Перенос делается копированием всей папки проекта.
 - Секреты не коммитятся (`system/bot/.env`, `system/secrets/` в `.gitignore`).
 
 ## CI/CD

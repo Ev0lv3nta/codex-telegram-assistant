@@ -5,13 +5,6 @@ from pathlib import Path
 import os
 
 
-def _parse_bool(value: str | None, default: bool) -> bool:
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    return normalized in {"1", "true", "yes", "on"}
-
-
 def _parse_int(value: str | None, default: int) -> int:
     if value is None or value.strip() == "":
         return default
@@ -41,11 +34,6 @@ class Settings:
     codex_timeout_sec: int
     codex_model: str
     codex_extra_args: str
-    auto_commit: bool
-    auto_push: bool
-    auto_push_hour_utc: int
-    git_user_name: str
-    git_user_email: str
     max_result_chars: int
     state_db_path: Path
     log_level: str
@@ -79,13 +67,6 @@ class Settings:
             codex_timeout_sec=_parse_int(os.getenv("CODEX_TIMEOUT_SEC"), 1800),
             codex_model=os.getenv("CODEX_MODEL", "").strip(),
             codex_extra_args=os.getenv("CODEX_EXTRA_ARGS", "").strip(),
-            auto_commit=_parse_bool(os.getenv("BOT_AUTO_COMMIT"), True),
-            auto_push=_parse_bool(os.getenv("BOT_AUTO_PUSH"), True),
-            auto_push_hour_utc=_parse_int(os.getenv("BOT_AUTO_PUSH_HOUR_UTC"), 3),
-            git_user_name=os.getenv("BOT_GIT_USER_NAME", "Assistant Bot"),
-            git_user_email=os.getenv(
-                "BOT_GIT_USER_EMAIL", "assistant-bot@local"
-            ),
             max_result_chars=_parse_int(os.getenv("BOT_MAX_RESULT_CHARS"), 3500),
             state_db_path=state_db,
             log_level=os.getenv("BOT_LOG_LEVEL", "INFO").upper(),

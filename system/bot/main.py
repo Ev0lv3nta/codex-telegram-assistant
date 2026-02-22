@@ -7,10 +7,8 @@ import traceback
 import threading
 from pathlib import Path
 
-from .classifier import Mode
 from .codex_runner import CodexRunner
 from .config import Settings
-from .git_ops import GitOps
 from .ingest import download_attachments
 from .queue_store import QueueStore
 from .session_gc import gc_sessions
@@ -19,14 +17,6 @@ from .worker import Worker
 
 
 LOGGER = logging.getLogger("assistant.main")
-LEGACY_MODE_BUTTONS = {
-    "Авто",
-    "Интейк",
-    "Исследование",
-    "Ответ",
-    "Финансы",
-    "Обслуживание",
-}
 
 HELP_TEXT = """
 Ассистент подключен.
@@ -138,34 +128,15 @@ def _handle_message(
         )
         return
 
-    if text.strip().lower().startswith("/mode"):
-        api.send_message(
-            chat_id,
-            "Режимы отключены. Просто пиши задачу свободным текстом.",
-        )
-        return
-
-    if text.strip() in LEGACY_MODE_BUTTONS:
-        api.send_message(
-            chat_id,
-            "Кнопки режимов больше не используются. Просто напиши задачу текстом.",
-        )
-        return
-
     attachments = download_attachments(api, settings.assistant_root, message)
     if not text and not attachments:
         return
-
-    effective_mode = Mode.AUTO
-    inbox_path = ""
 
     task_id = store.enqueue_task(
         chat_id=chat_id,
         user_id=user_id,
         username=username,
-        mode=effective_mode.value,
         text=text,
-        inbox_path=inbox_path,
         attachments=attachments,
     )
     LOGGER.info("Accepted task #%s from chat=%s", task_id, chat_id)
@@ -181,7 +152,6 @@ def run() -> None:
     store = QueueStore(settings.state_db_path)
     api = TelegramAPI(settings.telegram_token)
     runner = CodexRunner(settings)
-    git_ops = GitOps(settings)
     stop_event = threading.Event()
 
     worker = Worker(
@@ -189,7 +159,6 @@ def run() -> None:
         store=store,
         api=api,
         runner=runner,
-        git_ops=git_ops,
         stop_event=stop_event,
     )
     worker.start()

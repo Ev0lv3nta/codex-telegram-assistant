@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 import json
 import sqlite3
 import threading
@@ -19,9 +18,7 @@ class Task:
     chat_id: int
     user_id: int
     username: str
-    mode: str
     text: str
-    inbox_path: str
     attachments: list[str]
     created_at: str
 
@@ -40,25 +37,10 @@ class QueueStore:
     def _init_schema(self) -> None:
         with self._conn:
             self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    username TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    inbox_path TEXT NOT NULL,
-                    attachments_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    finished_at TEXT,
-                    result_text TEXT,
-                    error_text TEXT
-                )
-                """
+                self._tasks_schema_sql("tasks")
             )
+        self._migrate_legacy_tasks_schema_if_needed()
+        with self._conn:
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS meta (
@@ -68,32 +50,107 @@ class QueueStore:
                 """
             )
 
+    def _read_task_columns(self) -> set[str]:
+        rows = self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        return {str(row["name"]) for row in rows}
+
+    @staticmethod
+    def _tasks_schema_sql(table_name: str) -> str:
+        return f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                text TEXT NOT NULL,
+                attachments_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                result_text TEXT,
+                error_text TEXT
+            )
+        """
+
+    def _migrate_legacy_tasks_schema_if_needed(self) -> None:
+        columns = self._read_task_columns()
+        if "mode" not in columns and "inbox_path" not in columns:
+            return
+
+        with self._conn:
+            self._conn.execute("DROP TABLE IF EXISTS tasks_v2")
+            self._conn.execute(self._tasks_schema_sql("tasks_v2"))
+            self._conn.execute(
+                """
+                INSERT INTO tasks_v2 (
+                    id,
+                    chat_id,
+                    user_id,
+                    username,
+                    text,
+                    attachments_json,
+                    status,
+                    created_at,
+                    started_at,
+                    finished_at,
+                    result_text,
+                    error_text
+                )
+                SELECT
+                    id,
+                    chat_id,
+                    user_id,
+                    username,
+                    text,
+                    attachments_json,
+                    status,
+                    created_at,
+                    started_at,
+                    finished_at,
+                    result_text,
+                    error_text
+                FROM tasks
+                """
+            )
+            self._conn.execute("DROP TABLE tasks")
+            self._conn.execute("ALTER TABLE tasks_v2 RENAME TO tasks")
+            self._conn.execute("DELETE FROM sqlite_sequence WHERE name = 'tasks'")
+            self._conn.execute(
+                """
+                INSERT INTO sqlite_sequence(name, seq)
+                SELECT 'tasks', COALESCE(MAX(id), 0) FROM tasks
+                """
+            )
+
     def enqueue_task(
         self,
         chat_id: int,
         user_id: int,
         username: str,
-        mode: str,
         text: str,
-        inbox_path: str,
         attachments: list[str],
     ) -> int:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 """
                 INSERT INTO tasks (
-                    chat_id, user_id, username, mode, text, inbox_path,
-                    attachments_json, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    chat_id,
+                    user_id,
+                    username,
+                    text,
+                    attachments_json,
+                    status,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
                     user_id,
                     username,
-                    mode,
                     text,
-                    inbox_path,
                     json.dumps(attachments, ensure_ascii=False),
+                    "pending",
                     _utc_now(),
                 ),
             )
@@ -123,9 +180,7 @@ class QueueStore:
                 chat_id=int(row["chat_id"]),
                 user_id=int(row["user_id"]),
                 username=row["username"],
-                mode=row["mode"],
                 text=row["text"],
-                inbox_path=row["inbox_path"],
                 attachments=json.loads(row["attachments_json"]),
                 created_at=row["created_at"],
             )
@@ -169,12 +224,6 @@ class QueueStore:
                 """,
                 (key, value),
             )
-
-    def get_chat_mode(self, chat_id: int) -> str:
-        return self.get_meta(f"chat_mode:{chat_id}", "auto")
-
-    def set_chat_mode(self, chat_id: int, mode: str) -> None:
-        self.set_meta(f"chat_mode:{chat_id}", mode)
 
     def get_chat_session_id(self, chat_id: int) -> str:
         return self.get_meta(f"chat_session:{chat_id}", "")

@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import threading
-import time
 
-from .classifier import Mode
 from .codex_runner import CodexRunner
 from .config import Settings
-from .git_ops import GitOps
 from .prompts import build_prompt
 from .queue_store import QueueStore, Task
 from .telegram_api import TelegramAPI
@@ -28,7 +24,6 @@ class Worker(threading.Thread):
         store: QueueStore,
         api: TelegramAPI,
         runner: CodexRunner,
-        git_ops: GitOps,
         stop_event: threading.Event,
     ) -> None:
         super().__init__(daemon=True)
@@ -36,7 +31,6 @@ class Worker(threading.Thread):
         self._store = store
         self._api = api
         self._runner = runner
-        self._git_ops = git_ops
         self._stop_event = stop_event
         self._logger = logging.getLogger("assistant.worker")
 
@@ -49,17 +43,10 @@ class Worker(threading.Thread):
             self._process_task(task)
 
     def _process_task(self, task: Task) -> None:
-        try:
-            mode = Mode(task.mode)
-        except ValueError:
-            mode = Mode.AUTO
-
-        self._logger.info("Processing task #%s in mode=%s", task.id, mode.value)
+        self._logger.info("Processing task #%s", task.id)
         chat_session_id = self._store.get_chat_session_id(task.chat_id)
         prompt = build_prompt(
-            mode=mode,
             user_text=task.text,
-            inbox_path=task.inbox_path,
             attachments=task.attachments,
             include_bootstrap=not bool(chat_session_id),
         )
@@ -78,14 +65,6 @@ class Worker(threading.Thread):
                 result.session_id,
             )
         if result.success:
-            commit_note = self._git_ops.commit_if_needed(mode.value, task.id)
-            push_note = self._git_ops.push_if_due(self._store)
-            self._logger.info(
-                "Task #%s git ops: commit='%s' push='%s'",
-                task.id,
-                commit_note,
-                push_note,
-            )
             final_text = result.message.strip()
             final_text = _trim(final_text, self._settings.max_result_chars)
             self._store.complete_task(task.id, final_text)
