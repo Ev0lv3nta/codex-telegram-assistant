@@ -89,6 +89,37 @@ class CodexRunner:
         merged = ((stdout or "") + "\n" + (stderr or "")).strip()
         return merged or "(empty Codex response)"
 
+    @staticmethod
+    def _non_json_lines(text: str) -> list[str]:
+        result: list[str] = []
+        for raw_line in (text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("{") and line.endswith("}"):
+                continue
+            result.append(line)
+        return result
+
+    @classmethod
+    def _failure_text(cls, stdout: str, stderr: str) -> str:
+        candidates: list[str] = []
+        candidates.extend(cls._non_json_lines(stderr))
+        candidates.extend(cls._non_json_lines(stdout))
+        if not candidates:
+            return "Не удалось выполнить запрос в Codex CLI."
+        details = "\n".join(candidates[:6])
+        return f"Не удалось выполнить запрос в Codex CLI.\n\n{details}"
+
+    @classmethod
+    def _success_text(cls, parsed_message: str, stdout: str) -> str:
+        if parsed_message:
+            return parsed_message
+        lines = cls._non_json_lines(stdout)
+        if lines:
+            return "\n".join(lines[:6])
+        return "(empty Codex response)"
+
     def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
         try:
             if session_id:
@@ -103,10 +134,11 @@ class CodexRunner:
 
         parsed_session_id, parsed_message = self._parse_json_output(completed.stdout or "")
         effective_session_id = parsed_session_id or session_id
-        message = parsed_message or self._fallback_text(
-            completed.stdout or "", completed.stderr or ""
-        )
-
         if completed.returncode != 0:
-            return CodexRunResult(False, message, effective_session_id)
+            return CodexRunResult(
+                False,
+                self._failure_text(completed.stdout or "", completed.stderr or ""),
+                effective_session_id,
+            )
+        message = self._success_text(parsed_message, completed.stdout or "")
         return CodexRunResult(True, message, effective_session_id)

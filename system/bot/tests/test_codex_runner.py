@@ -28,6 +28,19 @@ class CodexRunnerParseTests(unittest.TestCase):
         self.assertEqual(session_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         self.assertEqual(message, "Финал")
 
+    def test_failure_text_ignores_json_events(self) -> None:
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"11111111-2222-3333-4444-555555555555"}',
+                '{"type":"item.completed","item":{"type":"reasoning","text":"internal details"}}',
+            ]
+        )
+        stderr = "ERROR codex_core::rollout::list: state db missing rollout path"
+        message = CodexRunner._failure_text(stdout, stderr)
+        self.assertIn("Не удалось выполнить запрос в Codex CLI.", message)
+        self.assertIn("state db missing rollout path", message)
+        self.assertNotIn("internal details", message)
+
 
 if __name__ == "__main__":
     unittest.main()
