@@ -176,6 +176,16 @@ class QueueStore:
     def set_chat_mode(self, chat_id: int, mode: str) -> None:
         self.set_meta(f"chat_mode:{chat_id}", mode)
 
+    def get_chat_session_id(self, chat_id: int) -> str:
+        return self.get_meta(f"chat_session:{chat_id}", "")
+
+    def set_chat_session_id(self, chat_id: int, session_id: str) -> None:
+        self.set_meta(f"chat_session:{chat_id}", session_id)
+
+    def clear_chat_session_id(self, chat_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM meta WHERE key = ?", (f"chat_session:{chat_id}",))
+
     def counts(self) -> dict[str, int]:
         rows = self._conn.execute(
             """
@@ -191,4 +201,3 @@ class QueueStore:
 
     def close(self) -> None:
         self._conn.close()
-

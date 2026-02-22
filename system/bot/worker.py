@@ -61,12 +61,21 @@ class Worker(threading.Thread):
             inbox_path=task.inbox_path,
             attachments=task.attachments,
         )
+        chat_session_id = self._store.get_chat_session_id(task.chat_id)
         try:
             self._api.send_chat_action(task.chat_id, "typing")
         except Exception:  # pragma: no cover
             pass
 
-        result = self._runner.run(prompt)
+        result = self._runner.run(prompt, session_id=chat_session_id)
+        if result.session_id and result.session_id != chat_session_id:
+            self._store.set_chat_session_id(task.chat_id, result.session_id)
+            self._logger.info(
+                "Task #%s: chat=%s session set to %s",
+                task.id,
+                task.chat_id,
+                result.session_id,
+            )
         if result.success:
             commit_note = self._git_ops.commit_if_needed(mode.value, task.id)
             push_note = self._git_ops.push_if_due(self._store)

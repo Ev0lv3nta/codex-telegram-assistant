@@ -33,6 +33,7 @@ HELP_TEXT = """
 - Пиши свободным текстом, как обычному личному ассистенту.
 - Можно прикладывать файлы/фото/голосовые.
 - `/status` показывает состояние очереди.
+- `/reset` сбрасывает сессию чата (начать новый контекст).
 
 Это прямой шлюз в Codex CLI: обычные сообщения обрабатываются как чат,
 а изменения файлов/кода делаются по явной просьбе.
@@ -60,8 +61,10 @@ def _extract_text(message: dict) -> str:
 
 def _render_status(store: QueueStore, chat_id: int) -> str:
     counts = store.counts()
+    session_id = store.get_chat_session_id(chat_id) or "(нет)"
     return (
         "Состояние бота:\n"
+        f"- session: {session_id}\n"
         f"- pending: {counts['pending']}\n"
         f"- running: {counts['running']}\n"
         f"- done: {counts['done']}\n"
@@ -100,6 +103,11 @@ def _handle_message(
 
     if text == "/status":
         api.send_message(chat_id, _render_status(store, chat_id))
+        return
+
+    if text == "/reset":
+        store.clear_chat_session_id(chat_id)
+        api.send_message(chat_id, "Сессия этого чата сброшена. Следующее сообщение начнет новый контекст.")
         return
 
     if text.strip().lower().startswith("/mode"):

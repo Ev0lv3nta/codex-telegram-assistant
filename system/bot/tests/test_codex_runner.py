@@ -1,0 +1,33 @@
+import unittest
+
+from system.bot.codex_runner import CodexRunner
+
+
+class CodexRunnerParseTests(unittest.TestCase):
+    def test_parse_json_output_extracts_session_and_message(self) -> None:
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"11111111-2222-3333-4444-555555555555"}',
+                '{"type":"item.completed","item":{"type":"reasoning","text":"..."}}',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Привет"}}',
+            ]
+        )
+        session_id, message = CodexRunner._parse_json_output(stdout)
+        self.assertEqual(session_id, "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(message, "Привет")
+
+    def test_parse_json_output_uses_last_agent_message(self) -> None:
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Черновик"}}',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"Финал"}}',
+            ]
+        )
+        session_id, message = CodexRunner._parse_json_output(stdout)
+        self.assertEqual(session_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(message, "Финал")
+
+
+if __name__ == "__main__":
+    unittest.main()
