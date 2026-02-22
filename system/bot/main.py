@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 import logging
 import signal
 import time
@@ -11,24 +10,13 @@ from .classifier import Mode
 from .codex_runner import CodexRunner
 from .config import Settings
 from .git_ops import GitOps
-from .ingest import download_attachments, write_inbox_markdown
+from .ingest import download_attachments
 from .queue_store import QueueStore
 from .telegram_api import TelegramAPI, TelegramAPIError
 from .worker import Worker
 
 
 LOGGER = logging.getLogger("assistant.main")
-SMALLTALK_PHRASES = {
-    "привет",
-    "здарова",
-    "здравствуйте",
-    "доброе утро",
-    "добрый день",
-    "добрый вечер",
-    "хай",
-    "hello",
-    "hi",
-}
 LEGACY_MODE_BUTTONS = {
     "Авто",
     "Интейк",
@@ -46,7 +34,8 @@ HELP_TEXT = """
 - Можно прикладывать файлы/фото/голосовые.
 - `/status` показывает состояние очереди.
 
-Все входящие сначала сохраняются в `00_inbox`, затем обрабатываются через Codex CLI.
+Это прямой шлюз в Codex CLI: обычные сообщения обрабатываются как чат,
+а изменения файлов/кода делаются по явной просьбе.
 """.strip()
 
 
@@ -67,18 +56,6 @@ def _is_authorized(settings: Settings, chat_id: int, user_id: int) -> bool:
 
 def _extract_text(message: dict) -> str:
     return (message.get("text") or message.get("caption") or "").strip()
-
-
-def _message_has_attachments(message: dict) -> bool:
-    keys = ("photo", "document", "voice", "audio", "video", "video_note")
-    return any(message.get(key) for key in keys)
-
-
-def _is_smalltalk(text: str) -> bool:
-    normalized = text.strip().lower().strip("!?. ,")
-    if not normalized:
-        return False
-    return normalized in SMALLTALK_PHRASES
 
 
 def _render_status(store: QueueStore, chat_id: int) -> str:
@@ -139,22 +116,12 @@ def _handle_message(
         )
         return
 
-    if text and not _message_has_attachments(message) and _is_smalltalk(text):
-        api.send_message(chat_id, "Привет. Чем помочь?")
-        return
-
     attachments = download_attachments(api, settings.assistant_root, message)
     if not text and not attachments:
         return
 
     effective_mode = Mode.AUTO
-    inbox_path = write_inbox_markdown(
-        assistant_root=settings.assistant_root,
-        message=message,
-        text=text,
-        mode=effective_mode.value,
-        attachments=attachments,
-    )
+    inbox_path = ""
 
     task_id = store.enqueue_task(
         chat_id=chat_id,
@@ -165,14 +132,7 @@ def _handle_message(
         inbox_path=inbox_path,
         attachments=attachments,
     )
-
-    api.send_message(
-        chat_id,
-        (
-            f"Принял задачу #{task_id}. "
-            "Обрабатываю."
-        ),
-    )
+    LOGGER.info("Accepted task #%s from chat=%s", task_id, chat_id)
 
 
 def run() -> None:
