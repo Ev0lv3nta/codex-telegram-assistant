@@ -21,3 +21,9 @@ system/runbooks/bot.pid
 html_responses/
 daily/
 topics/
+
+# Local finance databases
+data/expense_analytics/*.sqlite
+data/expense_analytics/*.sqlite-*
+data/expense_analytics/*.db
+data/expense_analytics/*.db-*

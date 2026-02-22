@@ -1,6 +1,6 @@
 # AGENTS
 
-Ты Codex CLI-ассистент, работающий через Telegram-шлюз в этом репозитории.
+Ты Codex CLI-агент, работающий через Telegram-шлюз в этом репозитории.
 
 ## Роль
 
@@ -27,6 +27,54 @@
   - `89_images/` изображения
 - HTML-ответы:
   - `html_responses/last-response.html` (единый файл для перезаписи)
+
+## Заметки (Daily и Topics)
+
+- Основной поток заметок: `daily/`.
+- Отдельные тематические заметки: `topics/` (создаются по прямой просьбе пользователя).
+- Daily-файл дня: `daily/YYYY-MM-DD.md`.
+- Перед записью в daily сначала проверь, существует ли файл за текущую дату:
+  - если существует, дописывай в него новую запись;
+  - если не существует, создай его и запиши первую запись.
+- Каждая запись в daily должна быть отдельным блоком:
+  - время в формате `HH:MM`;
+  - короткий заголовок;
+  - дальше свободный Markdown-текст по задаче.
+- Для `topics/` используй обычный Markdown, совместимый с Obsidian. Жесткая структура не требуется.
+
+## Учет финансов (SQLite)
+
+- База финансовых операций: `/root/personal-assistant/data/expense_analytics/expenses.sqlite`.
+- Таблица `transactions` (основные операции):
+  - `id INTEGER PRIMARY KEY AUTOINCREMENT`
+  - `kind TEXT NOT NULL DEFAULT 'expense' CHECK (kind IN ('expense', 'income'))`
+  - `amount REAL NOT NULL`
+  - `category TEXT NOT NULL DEFAULT 'other'`
+  - `place TEXT NOT NULL`
+  - `note TEXT NOT NULL`
+  - `event_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  - `created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+- Таблица `transaction_items` (позиции внутри операции, например товары в чеке):
+  - `id INTEGER PRIMARY KEY AUTOINCREMENT`
+  - `transaction_id INTEGER NOT NULL` (ссылка на `transactions.id`)
+  - `item_name TEXT NOT NULL`
+  - `item_amount REAL` (может быть `NULL`, если сумма позиции неизвестна)
+  - `item_note TEXT NOT NULL DEFAULT ''`
+  - `created_at TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+- По смыслу полей:
+  - `kind`: `expense` = расход, `income` = доход
+  - `category`: свободная категория (`products`, `subscriptions`, `transport`, `salary`, `gift`, `other` и т.д.)
+  - `event_at`: когда операция произошла по факту
+  - `created_at`: когда запись добавлена в базу
+- При добавлении записи в `transactions` заполняй минимум `kind`, `amount`, `category`, `place`, `note`; даты проставляй корректно (если время события неизвестно, допускается текущий момент).
+- Если пользователь просит "записать трату/доход", но данных не хватает (например, нет суммы, категории или места), задай 1 короткий уточняющий вопрос.
+- Примеры рабочих запросов (это только примеры для понимания, не ограничение: при необходимости используй любые корректные SQL-запросы под задачу пользователя):
+  - добавить расход: `INSERT INTO transactions (kind, amount, category, place, note, event_at) VALUES ('expense', ?, ?, ?, ?, ?)`
+  - добавить доход: `INSERT INTO transactions (kind, amount, category, place, note, event_at) VALUES ('income', ?, ?, ?, ?, ?)`
+  - добавить позицию товара: `INSERT INTO transaction_items (transaction_id, item_name, item_amount, item_note) VALUES (?, ?, ?, ?)`
+  - последние операции: `SELECT id, kind, amount, category, place, note, event_at, created_at FROM transactions ORDER BY event_at DESC LIMIT 20`
+  - сумма расходов за период: `SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'expense' AND event_at >= ? AND event_at < ?`
+  - сумма доходов за период: `SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE kind = 'income' AND event_at >= ? AND event_at < ?`
 
 ## Отправка файлов в Telegram
 
