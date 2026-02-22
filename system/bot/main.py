@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import signal
-import time
-import traceback
-import threading
 from pathlib import Path
+
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message, ReplyKeyboardRemove
 
 from .codex_runner import CodexRunner
 from .config import Settings
 from .ingest import download_attachments
 from .queue_store import QueueStore
 from .session_gc import gc_sessions
-from .telegram_api import TelegramAPI, TelegramAPIError
 from .worker import Worker
 
 
@@ -48,8 +48,8 @@ def _is_authorized(settings: Settings, chat_id: int, user_id: int) -> bool:
     return True
 
 
-def _extract_text(message: dict) -> str:
-    return (message.get("text") or message.get("caption") or "").strip()
+def _extract_text(message: Message) -> str:
+    return (message.text or message.caption or "").strip()
 
 
 def _render_status(store: QueueStore, chat_id: int) -> str:
@@ -65,153 +65,147 @@ def _render_status(store: QueueStore, chat_id: int) -> str:
     )
 
 
-def _handle_message(
-    settings: Settings,
-    store: QueueStore,
-    api: TelegramAPI,
-    message: dict,
-) -> None:
-    chat = message.get("chat") or {}
-    sender = message.get("from") or {}
+def _parse_gc_days(text: str) -> int | None:
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) == 1:
+        return 7
+    try:
+        return int(parts[1].strip())
+    except ValueError:
+        return None
 
-    chat_id = int(chat.get("id", 0))
-    user_id = int(sender.get("id", 0))
-    username = (
-        sender.get("username")
-        or " ".join(
-            token for token in [sender.get("first_name"), sender.get("last_name")] if token
-        )
-        or "unknown"
-    )
 
-    if not _is_authorized(settings, chat_id, user_id):
+def _build_dispatcher(settings: Settings, store: QueueStore, bot: Bot) -> Dispatcher:
+    dp = Dispatcher()
+
+    async def _guard(message: Message) -> bool:
+        sender = message.from_user
+        if sender is None:
+            return False
+        chat_id = int(message.chat.id)
+        user_id = int(sender.id)
+        if _is_authorized(settings, chat_id, user_id):
+            return True
         LOGGER.warning("Unauthorized access attempt: chat=%s user=%s", chat_id, user_id)
-        return
+        return False
 
-    text = _extract_text(message)
+    @dp.message(Command("start"))
+    async def on_start(message: Message) -> None:
+        if not await _guard(message):
+            return
+        await message.answer(
+            HELP_TEXT,
+            reply_markup=ReplyKeyboardRemove(),
+            disable_web_page_preview=True,
+        )
 
-    if text == "/start":
-        api.send_message(chat_id, HELP_TEXT, reply_markup={"remove_keyboard": True})
-        return
+    @dp.message(Command("status"))
+    async def on_status(message: Message) -> None:
+        if not await _guard(message):
+            return
+        await message.answer(_render_status(store, int(message.chat.id)))
 
-    if text == "/status":
-        api.send_message(chat_id, _render_status(store, chat_id))
-        return
-
-    if text == "/reset":
+    @dp.message(Command("reset"))
+    async def on_reset(message: Message) -> None:
+        if not await _guard(message):
+            return
+        chat_id = int(message.chat.id)
         store.clear_chat_session_id(chat_id)
-        api.send_message(chat_id, "Сессия этого чата сброшена. Следующее сообщение начнет новый контекст.")
-        return
+        await message.answer("Сессия этого чата сброшена. Следующее сообщение начнет новый контекст.")
 
-    if text.strip().lower().startswith("/gc"):
-        parts = text.strip().split(maxsplit=1)
-        days = 7
-        if len(parts) == 2:
-            try:
-                days = int(parts[1].strip())
-            except ValueError:
-                api.send_message(chat_id, "Использование: /gc [days]  (пример: /gc 30)")
-                return
-
+    @dp.message(Command("gc"))
+    async def on_gc(message: Message) -> None:
+        if not await _guard(message):
+            return
+        days = _parse_gc_days(message.text or "/gc")
+        if days is None:
+            await message.answer("Использование: /gc [days]  (пример: /gc 30)")
+            return
         keep = store.list_chat_session_ids()
         sessions_dir = Path("/root/.codex/sessions")
-        result = gc_sessions(sessions_dir=sessions_dir, keep_session_ids=keep, older_than_days=days)
-        api.send_message(
-            chat_id,
-            (
-                "GC Codex sessions:\n"
-                f"- deleted: {result.deleted_files}\n"
-                f"- kept(active): {result.kept_files}\n"
-                f"- skipped(recent): {result.skipped_files}\n"
-                f"- errors: {result.errors}"
-            ),
+        result = gc_sessions(
+            sessions_dir=sessions_dir,
+            keep_session_ids=keep,
+            older_than_days=days,
         )
-        return
+        await message.answer(
+            "GC Codex sessions:\n"
+            f"- deleted: {result.deleted_files}\n"
+            f"- kept(active): {result.kept_files}\n"
+            f"- skipped(recent): {result.skipped_files}\n"
+            f"- errors: {result.errors}"
+        )
 
-    attachments = download_attachments(api, settings.assistant_root, message)
-    if not text and not attachments:
-        return
+    @dp.message()
+    async def on_message(message: Message) -> None:
+        if not await _guard(message):
+            return
 
-    task_id = store.enqueue_task(
-        chat_id=chat_id,
-        user_id=user_id,
-        username=username,
-        text=text,
-        attachments=attachments,
-    )
-    LOGGER.info("Accepted task #%s from chat=%s", task_id, chat_id)
+        sender = message.from_user
+        if sender is None:
+            return
+        chat_id = int(message.chat.id)
+        user_id = int(sender.id)
+        username = (
+            sender.username
+            or " ".join(
+                token for token in [sender.first_name, sender.last_name] if token
+            )
+            or "unknown"
+        )
+
+        text = _extract_text(message)
+        attachments = await download_attachments(bot, settings.assistant_root, message)
+        if not text and not attachments:
+            return
+
+        task_id = store.enqueue_task(
+            chat_id=chat_id,
+            user_id=user_id,
+            username=username,
+            text=text,
+            attachments=attachments,
+        )
+        LOGGER.info("Accepted task #%s from chat=%s", task_id, chat_id)
+
+    return dp
 
 
-def run() -> None:
+async def _run_async() -> None:
     settings = Settings.from_env()
     _setup_logging(settings.log_level)
-
     LOGGER.info("Assistant root: %s", settings.assistant_root)
+
     settings.state_db_path.parent.mkdir(parents=True, exist_ok=True)
-
     store = QueueStore(settings.state_db_path)
-    api = TelegramAPI(settings.telegram_token)
+    bot = Bot(token=settings.telegram_token)
     runner = CodexRunner(settings)
-    stop_event = threading.Event()
-
+    stop_event = asyncio.Event()
     worker = Worker(
         settings=settings,
         store=store,
-        api=api,
+        bot=bot,
         runner=runner,
         stop_event=stop_event,
     )
-    worker.start()
-
-    def _shutdown(signum: int, _frame: object) -> None:
-        LOGGER.info("Shutdown signal received: %s", signum)
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    last_update_id = int(store.get_meta("last_update_id", "0") or "0")
-    LOGGER.info("Starting polling from update_id=%s", last_update_id + 1)
+    worker_task = asyncio.create_task(worker.run())
+    dispatcher = _build_dispatcher(settings, store, bot)
 
     try:
-        while not stop_event.is_set():
-            try:
-                updates = api.get_updates(
-                    offset=last_update_id + 1,
-                    timeout_sec=settings.poll_timeout_sec,
-                )
-            except TelegramAPIError as exc:
-                LOGGER.error("Telegram API error: %s", exc)
-                time.sleep(3)
-                continue
-            except Exception as exc:  # pragma: no cover
-                LOGGER.error("Unexpected polling error: %s", exc)
-                traceback.print_exc()
-                time.sleep(3)
-                continue
-
-            if not updates:
-                continue
-
-            for update in updates:
-                update_id = int(update.get("update_id", 0))
-                if update_id > last_update_id:
-                    last_update_id = update_id
-                    store.set_meta("last_update_id", str(last_update_id))
-
-                message = update.get("message")
-                if not message:
-                    continue
-
-                try:
-                    _handle_message(settings, store, api, message)
-                except Exception as exc:  # pragma: no cover
-                    LOGGER.error("Failed to handle message: %s", exc)
-                    traceback.print_exc()
+        await dispatcher.start_polling(
+            bot,
+            polling_timeout=settings.poll_timeout_sec,
+            allowed_updates=["message"],
+        )
     finally:
         stop_event.set()
-        worker.join(timeout=5)
+        await worker_task
         store.close()
+        await bot.session.close()
+
+
+def run() -> None:
+    asyncio.run(_run_async())
 
 
 if __name__ == "__main__":

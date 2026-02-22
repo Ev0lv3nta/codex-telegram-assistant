@@ -4,7 +4,7 @@
 
 ## Что уже есть
 
-- `system/bot/main.py`: long-polling Telegram-бот.
+- `system/bot/main.py`: Telegram-бот на `aiogram`.
 - `system/bot/queue_store.py`: очередь задач на SQLite (`system/tasks/bot_state.db`).
 - `system/bot/worker.py`: запуск `codex exec`/`codex exec resume` и отправка результата обратно в Telegram.
 - `system/runbooks/bootstrap.sh`: подготовка окружения.
