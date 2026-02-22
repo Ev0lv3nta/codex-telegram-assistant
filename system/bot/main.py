@@ -18,6 +18,17 @@ from .worker import Worker
 
 
 LOGGER = logging.getLogger("assistant.main")
+SMALLTALK_PHRASES = {
+    "привет",
+    "здарова",
+    "здравствуйте",
+    "доброе утро",
+    "добрый день",
+    "добрый вечер",
+    "хай",
+    "hello",
+    "hi",
+}
 LEGACY_MODE_BUTTONS = {
     "Авто",
     "Интейк",
@@ -56,6 +67,18 @@ def _is_authorized(settings: Settings, chat_id: int, user_id: int) -> bool:
 
 def _extract_text(message: dict) -> str:
     return (message.get("text") or message.get("caption") or "").strip()
+
+
+def _message_has_attachments(message: dict) -> bool:
+    keys = ("photo", "document", "voice", "audio", "video", "video_note")
+    return any(message.get(key) for key in keys)
+
+
+def _is_smalltalk(text: str) -> bool:
+    normalized = text.strip().lower().strip("!?. ,")
+    if not normalized:
+        return False
+    return normalized in SMALLTALK_PHRASES
 
 
 def _render_status(store: QueueStore, chat_id: int) -> str:
@@ -114,6 +137,10 @@ def _handle_message(
             chat_id,
             "Кнопки режимов больше не используются. Просто напиши задачу текстом.",
         )
+        return
+
+    if text and not _message_has_attachments(message) and _is_smalltalk(text):
+        api.send_message(chat_id, "Привет. Чем помочь?")
         return
 
     attachments = download_attachments(api, settings.assistant_root, message)
