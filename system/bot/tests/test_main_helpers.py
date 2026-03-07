@@ -3,8 +3,15 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from system.bot.autonomy_store import AutonomyStore
 from system.bot.config import Settings
-from system.bot.main import _delete_attachment_file, _transcribe_voice_if_needed
+from system.bot.main import (
+    _delete_attachment_file,
+    _note_chat_activity_from_message,
+    _render_autonomy_status,
+    _transcribe_voice_if_needed,
+)
+from system.bot.queue_store import QueueStore
 from system.bot.stt_openrouter import SttResult
 
 
@@ -130,6 +137,48 @@ class FileCleanupTests(unittest.TestCase):
 
             _delete_attachment_file(root, "88_files/voice.oga")
             self.assertFalse(target.exists())
+
+
+class ChatActivityTests(unittest.TestCase):
+    def test_note_chat_activity_from_command_message_updates_last_active_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = QueueStore(root / "state.db")
+            try:
+                message = SimpleNamespace(chat=SimpleNamespace(id=202))
+                _note_chat_activity_from_message(store, message)
+                self.assertEqual(store.get_last_active_chat_id(), 202)
+            finally:
+                store.close()
+
+
+class AutonomyStatusRenderTests(unittest.TestCase):
+    def test_render_autonomy_status_includes_meta_and_followup_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                parent_id = store.enqueue_task(chat_id=101, title="Первый шаг", kind="research")
+                store.enqueue_task(
+                    chat_id=101,
+                    title="Второй шаг",
+                    kind="research",
+                    source="followup",
+                    parent_task_id=parent_id,
+                )
+                store.mark_heartbeat("loop", "2026-03-06T20:00:00+00:00")
+                store.mark_heartbeat("planned", "2026-03-06T20:00:05+00:00")
+                store.mark_notify_sent(101, "2026-03-06T18:00:00+00:00")
+
+                text = _render_autonomy_status(store, 101, 1800)
+
+                self.assertIn("heartbeat:", text)
+                self.assertIn("last heartbeat status:", text)
+                self.assertIn("next heartbeat:", text)
+                self.assertIn("last notify:", text)
+                self.assertIn("src=followup", text)
+                self.assertIn(f"parent={parent_id}", text)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

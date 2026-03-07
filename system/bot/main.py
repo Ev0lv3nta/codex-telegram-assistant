@@ -3,14 +3,20 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+import subprocess
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import BotCommand, Message, ReplyKeyboardRemove
 
+from .autonomy_store import AutonomyStore
+from .autonomy_worker import AutonomyWorker
+from .autonomy_requests import ensure_autonomy_requests_scaffold
 from .codex_runner import CodexRunner
 from .config import Settings
 from .ingest import download_attachments
+from .memory_store import ensure_memory_scaffold
 from .queue_store import QueueStore
 from .session_gc import gc_sessions
 from .stt_openrouter import OpenRouterSttClient
@@ -18,6 +24,7 @@ from .worker import Worker
 
 
 LOGGER = logging.getLogger("assistant.main")
+BOT_SERVICE_NAME = "personal-assistant-bot.service"
 
 HELP_TEXT = """
 Ассистент подключен.
@@ -26,8 +33,10 @@ HELP_TEXT = """
 - Пиши свободным текстом, как обычному личному ассистенту.
 - Можно прикладывать файлы/фото/голосовые.
 - `/status` показывает состояние очереди.
+- `/autonomy` показывает последние автономные задачи.
 - `/reset` сбрасывает сессию чата (начать новый контекст).
 - `/gc [days]` чистит старые Codex-сессии на диске (по умолчанию 7 дней).
+- `/restart` перезапускает сервис бота.
 
 Это прямой шлюз в Codex CLI: обычные сообщения обрабатываются как чат,
 а изменения файлов/кода делаются по явной просьбе.
@@ -51,6 +60,15 @@ def _is_authorized(settings: Settings, chat_id: int, user_id: int) -> bool:
 
 def _extract_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
+
+
+def _note_chat_activity_from_message(store: QueueStore, message: Message) -> None:
+    store.note_chat_activity(int(message.chat.id))
+
+
+def _nudge_autonomy_wakeup(autonomy_store: AutonomyStore, message: Message) -> None:
+    autonomy_store.clear_idle_snooze(int(message.chat.id))
+    autonomy_store.schedule_next_wakeup_in(int(message.chat.id), 0)
 
 
 def _pick_audio_attachment(assistant_root: Path, attachments: list[str]) -> Path | None:
@@ -116,17 +134,99 @@ def _delete_attachment_file(assistant_root: Path, rel_path: str) -> None:
         LOGGER.warning("Failed to delete processed attachment %s: %s", rel_path, exc)
 
 
-def _render_status(store: QueueStore, chat_id: int) -> str:
+def _render_status(store: QueueStore, autonomy_store: AutonomyStore, chat_id: int) -> str:
     counts = store.counts()
+    autonomy_counts = autonomy_store.counts()
     session_id = store.get_chat_session_id(chat_id) or "(нет)"
+    session_owner = store.get_session_owner(chat_id) or "(свободна)"
+    heartbeat = autonomy_store.get_heartbeat("loop") or "(не было)"
     return (
         "Состояние бота:\n"
         f"- session: {session_id}\n"
+        f"- session owner: {session_owner}\n"
         f"- pending: {counts['pending']}\n"
         f"- running: {counts['running']}\n"
         f"- done: {counts['done']}\n"
-        f"- failed: {counts['failed']}"
+        f"- failed: {counts['failed']}\n"
+        f"- autonomy pending: {autonomy_counts['pending']}\n"
+        f"- autonomy running: {autonomy_counts['running']}\n"
+        f"- autonomy waiting_user: {autonomy_counts['waiting_user']}\n"
+        f"- autonomy done: {autonomy_counts['done']}\n"
+        f"- autonomy failed: {autonomy_counts['failed']}\n"
+        f"- autonomy heartbeat: {heartbeat}"
     )
+
+
+def _parse_iso_dt(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _format_eta_from_heartbeat(last_at: str, heartbeat_sec: int) -> str:
+    if not last_at:
+        return "(ожидание первого heartbeat)"
+    last_dt = _parse_iso_dt(last_at)
+    if last_dt is None:
+        return "(неизвестно)"
+    next_dt = last_dt + timedelta(seconds=heartbeat_sec)
+    remaining = next_dt - datetime.now(next_dt.tzinfo)
+    if remaining.total_seconds() <= 0:
+        return "due now"
+    total_seconds = int(remaining.total_seconds())
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"in {hours}h {minutes}m"
+    if minutes > 0:
+        return f"in {minutes}m {seconds}s"
+    return f"in {seconds}s"
+
+
+def _render_autonomy_status(
+    autonomy_store: AutonomyStore,
+    chat_id: int,
+    heartbeat_sec: int,
+) -> str:
+    counts = autonomy_store.counts_for_chat(chat_id)
+    tasks = autonomy_store.list_tasks(chat_id=chat_id, limit=5, order_by="recent")
+    heartbeat = autonomy_store.get_heartbeat("loop") or "(не было)"
+    heartbeat_kind = autonomy_store.get_last_heartbeat_kind() or "(не было)"
+    heartbeat_at = autonomy_store.get_last_heartbeat_at()
+    mode = autonomy_store.get_mode(chat_id) or "(не задан)"
+    next_wakeup = autonomy_store.get_next_wakeup(chat_id) or "(не задан)"
+    mission = autonomy_store.get_active_mission(chat_id)
+    notify_last_sent = autonomy_store.get_notify_last_sent(chat_id) or "(не было)"
+    lines = [
+        "Автономность:",
+        f"- pending: {counts['pending']}",
+        f"- running: {counts['running']}",
+        f"- waiting_user: {counts['waiting_user']}",
+        f"- done: {counts['done']}",
+        f"- failed: {counts['failed']}",
+        f"- mode: {mode}",
+        f"- next wakeup: {next_wakeup}",
+        f"- heartbeat: {heartbeat}",
+        f"- last heartbeat status: {heartbeat_kind}",
+        f"- next heartbeat: {_format_eta_from_heartbeat(heartbeat_at, heartbeat_sec)}",
+        f"- last notify: {notify_last_sent}",
+    ]
+    if mission is not None and mission.title.strip():
+        lines.append(f"- active mission: {mission.title} ({mission.kind})")
+    if not tasks:
+        lines.append("- recent: (нет задач)")
+        return "\n".join(lines)
+
+    lines.append("- recent:")
+    for task in tasks:
+        title = task.title.strip() or "(без названия)"
+        parent = f", parent={task.parent_task_id}" if task.parent_task_id is not None else ""
+        lines.append(
+            f"  - #{task.id} [{task.status}] {title} "
+            f"({task.kind}, src={task.source}, p={task.priority}{parent})"
+        )
+    return "\n".join(lines)
 
 
 def _parse_gc_days(text: str) -> int | None:
@@ -139,13 +239,110 @@ def _parse_gc_days(text: str) -> int | None:
         return None
 
 
+def _schedule_service_restart(service_name: str) -> tuple[bool, str]:
+    command = ["/bin/systemctl", "--no-block", "restart", service_name]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except Exception as exc:
+        return False, str(exc)
+    if completed.returncode in (0, -15):
+        return True, "restart-requested"
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or f"exit={completed.returncode}").strip()
+        return False, detail
+    return True, "restart-requested"
+
+
 def _build_dispatcher(
     settings: Settings,
     store: QueueStore,
+    autonomy_store: AutonomyStore,
     bot: Bot,
     stt_client: OpenRouterSttClient,
 ) -> Dispatcher:
     dp = Dispatcher()
+    media_group_messages: dict[str, list[Message]] = {}
+    media_group_flush_tasks: dict[str, asyncio.Task[None]] = {}
+    media_group_lock = asyncio.Lock()
+    media_group_flush_delay_sec = 1.2
+
+    def _dedupe_paths(paths: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            result.append(path)
+        return result
+
+    def _group_text(messages: list[Message]) -> str:
+        for item in messages:
+            text = _extract_text(item)
+            if text:
+                return text
+        return ""
+
+    async def _enqueue_grouped_messages(group_id: str) -> None:
+        async with media_group_lock:
+            messages = media_group_messages.pop(group_id, [])
+            media_group_flush_tasks.pop(group_id, None)
+
+        if not messages:
+            return
+
+        messages.sort(key=lambda m: int(m.message_id or 0))
+        first = messages[0]
+        sender = first.from_user
+        if sender is None:
+            return
+
+        chat_id = int(first.chat.id)
+        user_id = int(sender.id)
+        username = (
+            sender.username
+            or " ".join(token for token in [sender.first_name, sender.last_name] if token)
+            or "unknown"
+        )
+        text = _group_text(messages)
+
+        attachments: list[str] = []
+        for item in messages:
+            attachments.extend(await download_attachments(bot, settings.assistant_root, item))
+        attachments = _dedupe_paths(attachments)
+
+        if not text and not attachments:
+            return
+
+        task_id = store.enqueue_task(
+            chat_id=chat_id,
+            user_id=user_id,
+            username=username,
+            text=text,
+            attachments=attachments,
+        )
+        LOGGER.info(
+            "Accepted grouped task #%s from chat=%s media_group=%s items=%s attachments=%s",
+            task_id,
+            chat_id,
+            group_id,
+            len(messages),
+            len(attachments),
+        )
+
+    async def _schedule_media_group_message(message: Message) -> None:
+        group_id = str(message.media_group_id)
+        async with media_group_lock:
+            media_group_messages.setdefault(group_id, []).append(message)
+            previous = media_group_flush_tasks.get(group_id)
+            if previous is not None:
+                previous.cancel()
+
+            async def _flush_later() -> None:
+                await asyncio.sleep(media_group_flush_delay_sec)
+                await _enqueue_grouped_messages(group_id)
+
+            media_group_flush_tasks[group_id] = asyncio.create_task(_flush_later())
 
     async def _guard(message: Message) -> bool:
         sender = message.from_user
@@ -162,22 +359,57 @@ def _build_dispatcher(
     async def on_start(message: Message) -> None:
         if not await _guard(message):
             return
+        _note_chat_activity_from_message(store, message)
+        _nudge_autonomy_wakeup(autonomy_store, message)
         await message.answer(
             HELP_TEXT,
             reply_markup=ReplyKeyboardRemove(),
             disable_web_page_preview=True,
         )
 
+    @dp.message(Command("restart"))
+    async def on_restart(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        _nudge_autonomy_wakeup(autonomy_store, message)
+        await message.answer("Выполнен перезапуск сервиса.")
+        ok, detail = await asyncio.to_thread(_schedule_service_restart, BOT_SERVICE_NAME)
+        if ok:
+            LOGGER.info("Restart scheduled via unit: %s", detail)
+            return
+
+        LOGGER.error("Failed to schedule bot restart: %s", detail)
+        await message.answer(f"Не удалось запланировать перезапуск: {detail}")
+
     @dp.message(Command("status"))
     async def on_status(message: Message) -> None:
         if not await _guard(message):
             return
-        await message.answer(_render_status(store, int(message.chat.id)))
+        _note_chat_activity_from_message(store, message)
+        _nudge_autonomy_wakeup(autonomy_store, message)
+        await message.answer(_render_status(store, autonomy_store, int(message.chat.id)))
+
+    @dp.message(Command("autonomy"))
+    async def on_autonomy(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        _nudge_autonomy_wakeup(autonomy_store, message)
+        await message.answer(
+            _render_autonomy_status(
+                autonomy_store,
+                int(message.chat.id),
+                settings.autonomy_heartbeat_sec,
+            )
+        )
 
     @dp.message(Command("reset"))
     async def on_reset(message: Message) -> None:
         if not await _guard(message):
             return
+        _note_chat_activity_from_message(store, message)
+        _nudge_autonomy_wakeup(autonomy_store, message)
         chat_id = int(message.chat.id)
         store.clear_chat_session_id(chat_id)
         await message.answer("Сессия этого чата сброшена. Следующее сообщение начнет новый контекст.")
@@ -186,6 +418,8 @@ def _build_dispatcher(
     async def on_gc(message: Message) -> None:
         if not await _guard(message):
             return
+        _note_chat_activity_from_message(store, message)
+        _nudge_autonomy_wakeup(autonomy_store, message)
         days = _parse_gc_days(message.text or "/gc")
         if days is None:
             await message.answer("Использование: /gc [days]  (пример: /gc 30)")
@@ -208,6 +442,10 @@ def _build_dispatcher(
     @dp.message()
     async def on_message(message: Message) -> None:
         if not await _guard(message):
+            return
+
+        if message.media_group_id is not None:
+            await _schedule_media_group_message(message)
             return
 
         sender = message.from_user
@@ -256,6 +494,8 @@ def _build_dispatcher(
             text=text,
             attachments=attachments,
         )
+        autonomy_store.clear_idle_snooze(chat_id)
+        autonomy_store.schedule_next_wakeup_in(chat_id, 0)
         LOGGER.info("Accepted task #%s from chat=%s", task_id, chat_id)
 
     return dp
@@ -266,8 +506,22 @@ async def _run_async() -> None:
     _setup_logging(settings.log_level)
     LOGGER.info("Assistant root: %s", settings.assistant_root)
 
+    created_memory_files = ensure_memory_scaffold(settings.assistant_root)
+    if created_memory_files:
+        LOGGER.info(
+            "Initialized memory scaffold: %s",
+            ", ".join(path.relative_to(settings.assistant_root).as_posix() for path in created_memory_files),
+        )
+    created_requests_file = ensure_autonomy_requests_scaffold(settings.assistant_root)
+    if created_requests_file is not None:
+        LOGGER.info(
+            "Initialized autonomy requests scaffold: %s",
+            created_requests_file.relative_to(settings.assistant_root).as_posix(),
+        )
+
     settings.state_db_path.parent.mkdir(parents=True, exist_ok=True)
     store = QueueStore(settings.state_db_path)
+    autonomy_store = AutonomyStore(settings.state_db_path)
     bot = Bot(token=settings.telegram_token)
     runner = CodexRunner(settings)
     stt_client = OpenRouterSttClient(settings)
@@ -279,8 +533,28 @@ async def _run_async() -> None:
         runner=runner,
         stop_event=stop_event,
     )
+    autonomy_worker = AutonomyWorker(
+        settings=settings,
+        queue_store=store,
+        autonomy_store=autonomy_store,
+        bot=bot,
+        runner=runner,
+        stop_event=stop_event,
+    )
     worker_task = asyncio.create_task(worker.run())
-    dispatcher = _build_dispatcher(settings, store, bot, stt_client)
+    autonomy_worker_task = asyncio.create_task(autonomy_worker.run())
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Старт"),
+                BotCommand(command="status", description="Статус"),
+                BotCommand(command="autonomy", description="Автономность"),
+                BotCommand(command="restart", description="Перезапуск"),
+            ]
+        )
+    except Exception as exc:  # pragma: no cover
+        LOGGER.warning("Failed to configure bot commands menu: %s", exc)
+    dispatcher = _build_dispatcher(settings, store, autonomy_store, bot, stt_client)
 
     try:
         await dispatcher.start_polling(
@@ -291,7 +565,9 @@ async def _run_async() -> None:
     finally:
         stop_event.set()
         await worker_task
+        await autonomy_worker_task
         store.close()
+        autonomy_store.close()
         await bot.session.close()
 
 

@@ -12,7 +12,6 @@ system/.env
 system/bot/.env
 .venv/
 __pycache__/
-system/tasks/*.db
 system/runbooks/bot.pid
 
 # User/runtime artifacts
@@ -21,9 +20,4 @@ system/runbooks/bot.pid
 html_responses/
 daily/
 topics/
-
-# Local finance databases
-data/expense_analytics/*.sqlite
-data/expense_analytics/*.sqlite-*
-data/expense_analytics/*.db
-data/expense_analytics/*.db-*
+credentials.md

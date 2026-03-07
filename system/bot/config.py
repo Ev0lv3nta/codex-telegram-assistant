@@ -11,6 +11,17 @@ def _parse_int(value: str | None, default: int) -> int:
     return int(value)
 
 
+def _parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
 def _parse_int_set(value: str | None) -> set[int]:
     if not value:
         return set()
@@ -43,6 +54,19 @@ class Settings:
     openrouter_stt_max_audio_bytes: int
     state_db_path: Path
     log_level: str
+    autonomy_enabled: bool = False
+    autonomy_heartbeat_sec: int = 300
+    autonomy_loop_poll_sec: int = 60
+    autonomy_default_sleep_sec: int = 7200
+    autonomy_busy_retry_sec: int = 120
+    autonomy_session_step_limit: int = 4
+    autonomy_notify_enabled: bool = False
+    autonomy_notify_min_chars: int = 220
+    autonomy_notify_cooldown_sec: int = 10800
+    autonomy_idle_ask_enabled: bool = True
+    autonomy_idle_ask_cooldown_sec: int = 21600
+    autonomy_idle_sleep_sec: int = 21600
+    session_lease_sec: int = 1860
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -82,4 +106,28 @@ class Settings:
             openrouter_stt_max_audio_bytes=_parse_int(os.getenv("OPENROUTER_STT_MAX_AUDIO_BYTES"), 25 * 1024 * 1024),
             state_db_path=state_db,
             log_level=os.getenv("BOT_LOG_LEVEL", "INFO").upper(),
+            autonomy_enabled=_parse_bool(os.getenv("AUTONOMY_ENABLED"), False),
+            autonomy_heartbeat_sec=_parse_int(os.getenv("AUTONOMY_HEARTBEAT_SEC"), 300),
+            autonomy_loop_poll_sec=_parse_int(
+                os.getenv("AUTONOMY_LOOP_POLL_SEC"),
+                _parse_int(os.getenv("AUTONOMY_HEARTBEAT_SEC"), 300),
+            ),
+            autonomy_default_sleep_sec=_parse_int(
+                os.getenv("AUTONOMY_DEFAULT_SLEEP_SEC"), 7200
+            ),
+            autonomy_busy_retry_sec=_parse_int(
+                os.getenv("AUTONOMY_BUSY_RETRY_SEC"), 120
+            ),
+            autonomy_session_step_limit=_parse_int(
+                os.getenv("AUTONOMY_SESSION_STEP_LIMIT"), 4
+            ),
+            autonomy_notify_enabled=_parse_bool(os.getenv("AUTONOMY_NOTIFY_ENABLED"), False),
+            autonomy_notify_min_chars=_parse_int(os.getenv("AUTONOMY_NOTIFY_MIN_CHARS"), 220),
+            autonomy_notify_cooldown_sec=_parse_int(os.getenv("AUTONOMY_NOTIFY_COOLDOWN_SEC"), 10800),
+            autonomy_idle_ask_enabled=_parse_bool(os.getenv("AUTONOMY_IDLE_ASK_ENABLED"), True),
+            autonomy_idle_ask_cooldown_sec=_parse_int(
+                os.getenv("AUTONOMY_IDLE_ASK_COOLDOWN_SEC"), 21600
+            ),
+            autonomy_idle_sleep_sec=_parse_int(os.getenv("AUTONOMY_IDLE_SLEEP_SEC"), 21600),
+            session_lease_sec=_parse_int(os.getenv("BOT_SESSION_LEASE_SEC"), 1860),
         )
