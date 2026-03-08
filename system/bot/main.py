@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import tomllib
 from zoneinfo import ZoneInfo
+from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -27,6 +28,7 @@ from .config import Settings
 from .ingest import download_attachments
 from .memory_store import ensure_memory_scaffold
 from .queue_store import QueueStore
+from .session_gc import _extract_session_id
 from .self_restart import (
     consume_restart_notification_target,
     mark_restart_observed,
@@ -247,7 +249,84 @@ def _format_reset_epoch(epoch_value: object) -> str:
     return dt.strftime("%d.%m %H:%M MSK")
 
 
-def _render_codex_cli_status(codex_home: Path = CODEX_HOME) -> str:
+def _format_context_left_percent(total_tokens: object, model_context_window: object) -> str:
+    try:
+        used = int(total_tokens)
+        window = int(model_context_window)
+    except (TypeError, ValueError):
+        return "(неизвестно)"
+    if window <= 0:
+        return "(неизвестно)"
+    left = max(0.0, 100.0 - (used / window * 100.0))
+    return f"{left:.0f}% left"
+
+
+def _find_codex_session_file(
+    codex_home: Path,
+    *,
+    session_id: str = "",
+) -> Path | None:
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.exists():
+        return None
+    candidates = sorted(
+        sessions_root.rglob("*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if session_id.strip():
+        wanted = session_id.strip().lower()
+        for candidate in candidates:
+            if _extract_session_id(candidate) == wanted:
+                return candidate
+    return candidates[0] if candidates else None
+
+
+def _read_codex_session_snapshot(session_file: Path) -> dict[str, Any]:
+    latest_rate_limits: dict[str, object] | None = None
+    latest_turn_context: dict[str, object] | None = None
+    latest_task_started: dict[str, object] | None = None
+    latest_session_meta: dict[str, object] | None = None
+    try:
+        lines = session_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return {}
+    for raw_line in lines:
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        payload = event.get("payload")
+        if event_type == "session_meta" and isinstance(payload, dict):
+            latest_session_meta = payload
+        elif event_type == "turn_context" and isinstance(payload, dict):
+            latest_turn_context = payload
+        if isinstance(payload, dict):
+            payload_type = payload.get("type")
+            if event_type == "event_msg" or payload_type in {"task_started", "token_count"}:
+                if payload_type == "task_started":
+                    latest_task_started = payload
+                elif payload_type == "token_count":
+                    rate_limits = payload.get("rate_limits")
+                    if isinstance(rate_limits, dict):
+                        latest_rate_limits = rate_limits
+                    info = payload.get("info")
+                    if isinstance(info, dict):
+                        latest_turn_context = {**(latest_turn_context or {}), "_token_info": info}
+    return {
+        "rate_limits": latest_rate_limits or {},
+        "turn_context": latest_turn_context or {},
+        "task_started": latest_task_started or {},
+        "session_meta": latest_session_meta or {},
+    }
+
+
+def _render_codex_cli_status(
+    codex_home: Path = CODEX_HOME,
+    *,
+    chat_session_id: str = "",
+) -> str:
     version = "(неизвестно)"
     version_path = codex_home / "version.json"
     if version_path.exists():
@@ -267,34 +346,36 @@ def _render_codex_cli_status(codex_home: Path = CODEX_HOME) -> str:
         except (OSError, tomllib.TOMLDecodeError):
             pass
 
-    latest_session = ""
-    latest_rate_limits: dict[str, object] | None = None
-    sessions_root = codex_home / "sessions"
-    candidates = sorted(
-        sessions_root.rglob("*.jsonl") if sessions_root.exists() else [],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for candidate in candidates[:10]:
-        try:
-            lines = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        latest_payload: dict[str, object] | None = None
-        for raw_line in lines:
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-            payload = event.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("type") == "token_count" and isinstance(payload.get("rate_limits"), dict):
-                latest_payload = payload
-        if latest_payload is not None:
-            latest_rate_limits = latest_payload.get("rate_limits")  # type: ignore[assignment]
-            latest_session = candidate.stem
-            break
+    session_file = _find_codex_session_file(codex_home, session_id=chat_session_id)
+    snapshot = _read_codex_session_snapshot(session_file) if session_file is not None else {}
+    latest_rate_limits = snapshot.get("rate_limits") if isinstance(snapshot, dict) else {}
+    turn_context = snapshot.get("turn_context") if isinstance(snapshot, dict) else {}
+    task_started = snapshot.get("task_started") if isinstance(snapshot, dict) else {}
+    session_meta = snapshot.get("session_meta") if isinstance(snapshot, dict) else {}
+
+    session_model = ""
+    session_reasoning = ""
+    if isinstance(turn_context, dict):
+        session_model = str(turn_context.get("model") or "")
+        session_reasoning = str(turn_context.get("effort") or "")
+        token_info = turn_context.get("_token_info")
+    else:
+        token_info = None
+    if not session_model and isinstance(session_meta, dict):
+        session_model = str(session_meta.get("model") or "")
+    if session_model:
+        model = session_model
+    if session_reasoning:
+        reasoning = session_reasoning
+
+    model_context_window = ""
+    if isinstance(task_started, dict):
+        model_context_window = str(task_started.get("model_context_window") or "")
+    total_tokens = ""
+    if isinstance(token_info, dict):
+        total_usage = token_info.get("total_token_usage")
+        if isinstance(total_usage, dict):
+            total_tokens = str(total_usage.get("total_tokens") or "")
 
     lines = [
         f"Codex CLI status:",
@@ -302,8 +383,14 @@ def _render_codex_cli_status(codex_home: Path = CODEX_HOME) -> str:
         f"- model: {model}",
         f"- reasoning: {reasoning}",
     ]
-    if latest_session:
-        lines.append(f"- latest session: {latest_session}")
+    if chat_session_id.strip():
+        lines.append(f"- chat session: {chat_session_id.strip()}")
+    if session_file is not None:
+        lines.append(f"- session file: {session_file.stem}")
+    if total_tokens and model_context_window:
+        lines.append(
+            f"- context left: {_format_context_left_percent(total_tokens, model_context_window)}"
+        )
 
     if isinstance(latest_rate_limits, dict):
         primary = latest_rate_limits.get("primary")
@@ -730,7 +817,11 @@ def _build_dispatcher(
         if not await _guard(message):
             return
         _note_chat_activity_from_message(store, message)
-        await message.answer(_render_codex_cli_status())
+        await message.answer(
+            _render_codex_cli_status(
+                chat_session_id=store.get_chat_session_id(int(message.chat.id)) or "",
+            )
+        )
 
     @dp.message(Command("pulse"))
     async def on_pulse(message: Message) -> None:
