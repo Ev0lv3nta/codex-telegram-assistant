@@ -249,9 +249,9 @@ def _format_reset_epoch(epoch_value: object) -> str:
     return dt.strftime("%d.%m %H:%M MSK")
 
 
-def _format_context_left_percent(total_tokens: object, model_context_window: object) -> str:
+def _format_context_left_percent(turn_tokens: object, model_context_window: object) -> str:
     try:
-        used = int(total_tokens)
+        used = int(turn_tokens)
         window = int(model_context_window)
     except (TypeError, ValueError):
         return "(неизвестно)"
@@ -346,12 +346,27 @@ def _render_codex_cli_status(
         except (OSError, tomllib.TOMLDecodeError):
             pass
 
-    session_file = _find_codex_session_file(codex_home, session_id=chat_session_id)
+    requested_session = chat_session_id.strip()
+    session_file = (
+        _find_codex_session_file(codex_home, session_id=requested_session)
+        if requested_session
+        else None
+    )
     snapshot = _read_codex_session_snapshot(session_file) if session_file is not None else {}
     latest_rate_limits = snapshot.get("rate_limits") if isinstance(snapshot, dict) else {}
     turn_context = snapshot.get("turn_context") if isinstance(snapshot, dict) else {}
     task_started = snapshot.get("task_started") if isinstance(snapshot, dict) else {}
     session_meta = snapshot.get("session_meta") if isinstance(snapshot, dict) else {}
+    if not latest_rate_limits:
+        latest_session_file = _find_codex_session_file(codex_home)
+        latest_snapshot = (
+            _read_codex_session_snapshot(latest_session_file)
+            if latest_session_file is not None
+            else {}
+        )
+        fallback_limits = latest_snapshot.get("rate_limits") if isinstance(latest_snapshot, dict) else {}
+        if isinstance(fallback_limits, dict):
+            latest_rate_limits = fallback_limits
 
     session_model = ""
     session_reasoning = ""
@@ -371,11 +386,11 @@ def _render_codex_cli_status(
     model_context_window = ""
     if isinstance(task_started, dict):
         model_context_window = str(task_started.get("model_context_window") or "")
-    total_tokens = ""
+    turn_tokens = ""
     if isinstance(token_info, dict):
-        total_usage = token_info.get("total_token_usage")
-        if isinstance(total_usage, dict):
-            total_tokens = str(total_usage.get("total_tokens") or "")
+        last_usage = token_info.get("last_token_usage")
+        if isinstance(last_usage, dict):
+            turn_tokens = str(last_usage.get("total_tokens") or "")
 
     lines = [
         f"Codex CLI status:",
@@ -383,13 +398,15 @@ def _render_codex_cli_status(
         f"- model: {model}",
         f"- reasoning: {reasoning}",
     ]
-    if chat_session_id.strip():
-        lines.append(f"- chat session: {chat_session_id.strip()}")
+    if requested_session:
+        lines.append(f"- chat session: {requested_session}")
+    else:
+        lines.append("- chat session: (нет активной сессии у этого чата)")
     if session_file is not None:
         lines.append(f"- session file: {session_file.stem}")
-    if total_tokens and model_context_window:
+    if turn_tokens and model_context_window:
         lines.append(
-            f"- context left: {_format_context_left_percent(total_tokens, model_context_window)}"
+            f"- context est.: {_format_context_left_percent(turn_tokens, model_context_window)} (last turn)"
         )
 
     if isinstance(latest_rate_limits, dict):

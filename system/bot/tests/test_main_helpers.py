@@ -317,7 +317,7 @@ class AutonomyStatusRenderTests(unittest.TestCase):
                         '{"timestamp":"2026-03-08T10:00:00Z","type":"session_meta","payload":{"id":"019c8920-41f4-75a3-aaac-63d21c697f8e"}}',
                         '{"timestamp":"2026-03-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","model_context_window":2000}}',
                         '{"timestamp":"2026-03-08T10:00:02Z","type":"turn_context","payload":{"model":"gpt-5.4","effort":"high"}}',
-                        '{"timestamp":"2026-03-08T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":500}},"rate_limits":{"primary":{"used_percent":10,"resets_at":1773000000},"secondary":{"used_percent":25,"resets_at":1773600000},"plan_type":"plus"}}}',
+                        '{"timestamp":"2026-03-08T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1500},"last_token_usage":{"total_tokens":500}},"rate_limits":{"primary":{"used_percent":10,"resets_at":1773000000},"secondary":{"used_percent":25,"resets_at":1773600000},"plan_type":"plus"}}}',
                     ]
                 ),
                 encoding="utf-8",
@@ -331,8 +331,31 @@ class AutonomyStatusRenderTests(unittest.TestCase):
             self.assertIn(f"chat session: {target_session}", text)
             self.assertIn("session file: rollout-test-", text)
             self.assertIn("reasoning: high", text)
-            self.assertIn("context left: 75% left", text)
+            self.assertIn("context est.: 75% left (last turn)", text)
             self.assertIn("5h limit: 90% left", text)
+
+    def test_render_codex_cli_status_without_chat_session_does_not_pick_random_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            codex_home = Path(td)
+            session_id = "019c8920-41f4-75a3-aaac-63d21c697f8e"
+            (codex_home / "sessions" / "2026" / "03" / "08").mkdir(parents=True, exist_ok=True)
+            (codex_home / "config.toml").write_text(
+                'model = "gpt-5.4"\nmodel_reasoning_effort = "medium"\n',
+                encoding="utf-8",
+            )
+            session_file = (
+                codex_home / "sessions" / "2026" / "03" / "08" / f"rollout-test-{session_id}.jsonl"
+            )
+            session_file.write_text(
+                '{"timestamp":"2026-03-08T10:00:01Z","type":"event_msg","payload":{"type":"task_started","model_context_window":2000}}',
+                encoding="utf-8",
+            )
+
+            text = _render_codex_cli_status(codex_home=codex_home, chat_session_id="")
+
+            self.assertIn("chat session: (нет активной сессии у этого чата)", text)
+            self.assertNotIn("session file:", text)
+            self.assertNotIn("context est.:", text)
 
     def test_allowed_update_types_include_callback_query(self) -> None:
         self.assertEqual(_allowed_update_types(), ["message", "callback_query"])
