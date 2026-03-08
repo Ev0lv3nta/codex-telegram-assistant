@@ -13,6 +13,7 @@ from system.bot.main import (
     _enqueue_restart_success_task,
     _note_chat_activity_from_message,
     _note_passive_owner_touch,
+    _render_codex_cli_status,
     _stop_autonomy_now,
     _render_autonomy_pulse,
     _schedule_autonomy_snooze,
@@ -265,7 +266,38 @@ class ChatActivityTests(unittest.TestCase):
 class AutonomyStatusRenderTests(unittest.TestCase):
     def test_build_bot_commands_includes_pulse(self) -> None:
         commands = _build_bot_commands()
-        self.assertEqual([item.command for item in commands], ["start", "pulse", "status", "autonomy", "restart"])
+        self.assertEqual(
+            [item.command for item in commands],
+            ["start", "pulse", "status", "codexstatus", "autonomy", "restart"],
+        )
+
+    def test_render_codex_cli_status_reads_local_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            codex_home = Path(td)
+            (codex_home / "sessions" / "2026" / "03" / "08").mkdir(parents=True, exist_ok=True)
+            (codex_home / "version.json").write_text('{"version":"0.111.0"}', encoding="utf-8")
+            (codex_home / "config.toml").write_text(
+                'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\n',
+                encoding="utf-8",
+            )
+            session_file = codex_home / "sessions" / "2026" / "03" / "08" / "rollout-test.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        '{"timestamp":"2026-03-08T10:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":20,"resets_at":1773000000},"secondary":{"used_percent":35,"resets_at":1773600000},"plan_type":"plus"}}}',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            text = _render_codex_cli_status(codex_home)
+
+            self.assertIn("version: 0.111.0", text)
+            self.assertIn("model: gpt-5.4", text)
+            self.assertIn("reasoning: high", text)
+            self.assertIn("5h limit: 80% left", text)
+            self.assertIn("weekly limit: 65% left", text)
+            self.assertIn("plan: plus", text)
 
     def test_allowed_update_types_include_callback_query(self) -> None:
         self.assertEqual(_allowed_update_types(), ["message", "callback_query"])

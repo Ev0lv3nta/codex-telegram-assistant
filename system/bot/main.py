@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import tomllib
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
@@ -37,6 +39,7 @@ from .worker import Worker
 
 LOGGER = logging.getLogger("assistant.main")
 BOT_SERVICE_NAME = "personal-assistant-bot.service"
+CODEX_HOME = Path("/root/.codex")
 PULSE_CALLBACK_DATA = "autonomy:pulse"
 PULSE_SNOOZE_CALLBACK_DATA = "autonomy:pulse:snooze:6h"
 PULSE_WAKE_CALLBACK_DATA = "autonomy:pulse:wake:now"
@@ -52,6 +55,7 @@ HELP_TEXT = """
 - Можно прикладывать файлы/фото/голосовые.
 - `/pulse` показывает короткий owner-facing пульс автономности.
 - `/status` показывает состояние очереди.
+- `/codexstatus` показывает модель и usage-лимиты Codex CLI.
 - `/autonomy` показывает последние автономные задачи.
 - `/reset` сбрасывает сессию чата (начать новый контекст).
 - `/gc [days]` чистит старые Codex-сессии на диске (по умолчанию 7 дней).
@@ -67,6 +71,7 @@ def _build_bot_commands() -> list[BotCommand]:
         BotCommand(command="start", description="Старт"),
         BotCommand(command="pulse", description="Пульс автономности"),
         BotCommand(command="status", description="Статус"),
+        BotCommand(command="codexstatus", description="Лимиты Codex CLI"),
         BotCommand(command="autonomy", description="Автономность"),
         BotCommand(command="restart", description="Перезапуск"),
     ]
@@ -231,6 +236,97 @@ def _render_status(store: QueueStore, autonomy_store: AutonomyStore, chat_id: in
         f"- autonomy failed: {autonomy_counts['failed']}\n"
         f"- autonomy heartbeat: {heartbeat}"
     )
+
+
+def _format_reset_epoch(epoch_value: object) -> str:
+    try:
+        epoch = int(epoch_value)
+    except (TypeError, ValueError):
+        return "(неизвестно)"
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(MSK)
+    return dt.strftime("%d.%m %H:%M MSK")
+
+
+def _render_codex_cli_status(codex_home: Path = CODEX_HOME) -> str:
+    version = "(неизвестно)"
+    version_path = codex_home / "version.json"
+    if version_path.exists():
+        try:
+            version = str(json.loads(version_path.read_text(encoding="utf-8")).get("version") or version)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    model = "(не задана)"
+    reasoning = "(не задан)"
+    config_path = codex_home / "config.toml"
+    if config_path.exists():
+        try:
+            config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            model = str(config.get("model") or model)
+            reasoning = str(config.get("model_reasoning_effort") or reasoning)
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+
+    latest_session = ""
+    latest_rate_limits: dict[str, object] | None = None
+    sessions_root = codex_home / "sessions"
+    candidates = sorted(
+        sessions_root.rglob("*.jsonl") if sessions_root.exists() else [],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates[:10]:
+        try:
+            lines = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        latest_payload: dict[str, object] | None = None
+        for raw_line in lines:
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "token_count" and isinstance(payload.get("rate_limits"), dict):
+                latest_payload = payload
+        if latest_payload is not None:
+            latest_rate_limits = latest_payload.get("rate_limits")  # type: ignore[assignment]
+            latest_session = candidate.stem
+            break
+
+    lines = [
+        f"Codex CLI status:",
+        f"- version: {version}",
+        f"- model: {model}",
+        f"- reasoning: {reasoning}",
+    ]
+    if latest_session:
+        lines.append(f"- latest session: {latest_session}")
+
+    if isinstance(latest_rate_limits, dict):
+        primary = latest_rate_limits.get("primary")
+        secondary = latest_rate_limits.get("secondary")
+        if isinstance(primary, dict):
+            used = float(primary.get("used_percent") or 0.0)
+            lines.append(
+                f"- 5h limit: {max(0.0, 100.0 - used):.0f}% left "
+                f"(resets {_format_reset_epoch(primary.get('resets_at'))})"
+            )
+        if isinstance(secondary, dict):
+            used = float(secondary.get("used_percent") or 0.0)
+            lines.append(
+                f"- weekly limit: {max(0.0, 100.0 - used):.0f}% left "
+                f"(resets {_format_reset_epoch(secondary.get('resets_at'))})"
+            )
+        plan_type = latest_rate_limits.get("plan_type")
+        if plan_type:
+            lines.append(f"- plan: {plan_type}")
+    else:
+        lines.append("- limits: локальный usage-state пока не найден")
+
+    return "\n".join(lines)
 
 
 def _parse_iso_dt(value: str) -> datetime | None:
@@ -628,6 +724,13 @@ def _build_dispatcher(
         _note_chat_activity_from_message(store, message)
         _nudge_autonomy_wakeup(autonomy_store, message, autonomy_wake_event)
         await message.answer(_render_status(store, autonomy_store, int(message.chat.id)))
+
+    @dp.message(Command("codexstatus"))
+    async def on_codex_status(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        await message.answer(_render_codex_cli_status())
 
     @dp.message(Command("pulse"))
     async def on_pulse(message: Message) -> None:
