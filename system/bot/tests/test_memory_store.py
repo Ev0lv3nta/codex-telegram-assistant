@@ -32,8 +32,13 @@ class MemoryStoreTests(unittest.TestCase):
         note = build_memory_prompt_note()
         self.assertIn("memory/about_user.md", note)
         self.assertIn("memory/about_self.md", note)
+        self.assertIn("memory/open_loops.md", note)
+        self.assertIn("memory/initiative_backlog.md", note)
+        self.assertIn("topics/assistant-constitution.md", note)
         self.assertIn("system/tasks/autonomy_requests.md", note)
         self.assertIn("topics/autonomy-companion-plan.md", note)
+        self.assertIn("реально незавершённые линии", note)
+        self.assertIn("ещё не выполненные инициативы", note)
 
 if __name__ == "__main__":
     unittest.main()

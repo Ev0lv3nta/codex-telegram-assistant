@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 AUTONOMY_NEXT_START = "[[autonomy-next]]"
 AUTONOMY_NEXT_END = "[[/autonomy-next]]"
+SELF_REVIEW_START = "[[self-review]]"
+SELF_REVIEW_END = "[[/self-review]]"
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,39 @@ class AutonomyContinuation:
     priority: int
     delay_sec: int
     details: str
+
+
+@dataclass(frozen=True)
+class AutonomySelfReview:
+    change: str
+    why: str
+    risk: str
+    check: str
+
+
+def _extract_block_lines(text: str, start_marker: str, end_marker: str) -> tuple[str, list[str] | None]:
+    lines = (text or "").splitlines()
+    start_index: int | None = None
+    end_index: int | None = None
+
+    for index, raw_line in enumerate(lines):
+        if raw_line.strip().lower() == start_marker:
+            start_index = index
+
+    if start_index is None:
+        return (text or "").strip(), None
+
+    for index in range(start_index + 1, len(lines)):
+        if lines[index].strip().lower() == end_marker:
+            end_index = index
+            break
+
+    if end_index is None:
+        return (text or "").strip(), None
+
+    clean_lines = lines[:start_index] + lines[end_index + 1 :]
+    clean_text = "\n".join(clean_lines).strip()
+    return clean_text, lines[start_index + 1 : end_index]
 
 
 def _parse_multisection_fields(lines: list[str]) -> tuple[dict[str, str], list[str], list[str]]:
@@ -90,28 +125,13 @@ def parse_wakeup_decision(text: str) -> WakeupDecision:
 
 
 def extract_autonomy_continuation(text: str) -> tuple[str, AutonomyContinuation | None]:
-    lines = (text or "").splitlines()
-    start_index: int | None = None
-    end_index: int | None = None
-
-    for index, raw_line in enumerate(lines):
-        if raw_line.strip().lower() == AUTONOMY_NEXT_START:
-            start_index = index
-
-    if start_index is None:
-        return (text or "").strip(), None
-
-    for index in range(start_index + 1, len(lines)):
-        if lines[index].strip().lower() == AUTONOMY_NEXT_END:
-            end_index = index
-            break
-
-    if end_index is None:
-        return (text or "").strip(), None
-
-    clean_lines = lines[:start_index] + lines[end_index + 1 :]
-    clean_text = "\n".join(clean_lines).strip()
-    block_lines = lines[start_index + 1 : end_index]
+    clean_text, block_lines = _extract_block_lines(
+        text,
+        AUTONOMY_NEXT_START,
+        AUTONOMY_NEXT_END,
+    )
+    if block_lines is None:
+        return clean_text, None
     fields, details_lines, _ = _parse_multisection_fields(block_lines)
 
     action = fields.get("ACTION", "NOOP").strip().upper() or "NOOP"
@@ -150,3 +170,31 @@ def extract_autonomy_continuation(text: str) -> tuple[str, AutonomyContinuation 
             details=details,
         ),
     )
+
+
+def extract_self_review(text: str) -> tuple[str, AutonomySelfReview | None]:
+    clean_text, block_lines = _extract_block_lines(
+        text,
+        SELF_REVIEW_START,
+        SELF_REVIEW_END,
+    )
+    if block_lines is None:
+        return clean_text, None
+
+    fields: dict[str, str] = {}
+    for raw_line in block_lines:
+        line = raw_line.strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().upper()] = value.strip()
+
+    review = AutonomySelfReview(
+        change=fields.get("CHANGE", ""),
+        why=fields.get("WHY", ""),
+        risk=fields.get("RISK", ""),
+        check=fields.get("CHECK", ""),
+    )
+    if not any([review.change, review.why, review.risk, review.check]):
+        return clean_text, None
+    return clean_text, review

@@ -168,6 +168,68 @@ class AutonomyStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_continue_task_reuses_same_record_for_future_step(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                task_id = store.enqueue_task(
+                    chat_id=101,
+                    title="Первый шаг",
+                    details="Сделать базовый обзор",
+                    kind="research",
+                    priority=40,
+                )
+                claimed = store.claim_next_ready_task(chat_id=101)
+                self.assertIsNotNone(claimed)
+
+                store.continue_task(
+                    task_id,
+                    title="Продолжить обзор",
+                    details="Проверить ещё один источник",
+                    kind="research",
+                    priority=35,
+                    scheduled_for="2026-03-06T12:00:00+00:00",
+                    progress_text="Уже собран первый вывод.",
+                )
+
+                pending = store.list_tasks(chat_id=101, statuses={"pending"}, limit=5)
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].id, task_id)
+                self.assertEqual(pending[0].title, "Продолжить обзор")
+                self.assertEqual(pending[0].details, "Проверить ещё один источник")
+                self.assertEqual(pending[0].priority, 35)
+                self.assertEqual(pending[0].scheduled_for, "2026-03-06T12:00:00+00:00")
+                self.assertEqual(pending[0].result_text, "Уже собран первый вывод.")
+                self.assertEqual(pending[0].continuation_count, 1)
+            finally:
+                store.close()
+
+    def test_active_mission_roundtrip_keeps_scheduled_for(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                store.set_active_mission(
+                    101,
+                    task_id=7,
+                    title="Продолжить автономную линию",
+                    details="Вернуться к следующему шагу позже",
+                    kind="project",
+                    source="assistant",
+                    phase="scheduled",
+                    scheduled_for="2026-03-06T12:00:00+00:00",
+                )
+
+                mission = store.get_active_mission(101)
+
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.task_id, 7)
+                self.assertEqual(mission.title, "Продолжить автономную линию")
+                self.assertEqual(mission.phase, "scheduled")
+                self.assertEqual(mission.scheduled_for, "2026-03-06T12:00:00+00:00")
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

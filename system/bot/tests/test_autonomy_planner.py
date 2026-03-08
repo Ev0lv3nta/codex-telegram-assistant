@@ -1,6 +1,10 @@
 import unittest
 
-from system.bot.autonomy_planner import extract_autonomy_continuation, parse_wakeup_decision
+from system.bot.autonomy_planner import (
+    extract_autonomy_continuation,
+    extract_self_review,
+    parse_wakeup_decision,
+)
 
 
 class AutonomyPlannerTests(unittest.TestCase):
@@ -71,3 +75,26 @@ class AutonomyPlannerTests(unittest.TestCase):
         self.assertEqual(continuation.priority, 40)
         self.assertEqual(continuation.delay_sec, 900)
         self.assertIn("2 источника", continuation.details)
+
+    def test_extract_self_review_strips_internal_block(self) -> None:
+        clean_text, review = extract_self_review(
+            "\n".join(
+                [
+                    "Сделал один кодовый шаг.",
+                    "",
+                    "[[self-review]]",
+                    "CHANGE: Добавил owner-facing pulse.",
+                    "WHY: Чтобы владелец видел состояние автономности.",
+                    "RISK: Можно случайно будить контур лишний раз.",
+                    "CHECK: Прогнать unit-тесты и проверить live refresh.",
+                    "[[/self-review]]",
+                ]
+            )
+        )
+        self.assertEqual(clean_text, "Сделал один кодовый шаг.")
+        self.assertIsNotNone(review)
+        assert review is not None
+        self.assertIn("owner-facing pulse", review.change)
+        self.assertIn("владелец видел", review.why)
+        self.assertIn("будить контур", review.risk)
+        self.assertIn("unit-тесты", review.check)

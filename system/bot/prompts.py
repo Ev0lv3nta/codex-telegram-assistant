@@ -2,6 +2,7 @@ from __future__ import annotations
 
 AGENTS_MD_PATH = "/root/personal-assistant/AGENTS.md"
 AUTONOMY_PLAN_PATH = "/root/personal-assistant/topics/autonomy-companion-plan.md"
+ASSISTANT_CONSTITUTION_PATH = "/root/personal-assistant/topics/assistant-constitution.md"
 AUTONOMY_JOURNAL_GLOB = "/root/personal-assistant/system/tasks/autonomy_journal/YYYY-MM-DD.md"
 AUTONOMY_REQUESTS_PATH = "/root/personal-assistant/system/tasks/autonomy_requests.md"
 MEMORY_FILES = [
@@ -46,7 +47,10 @@ def _send_files_protocol_note() -> str:
 def _risky_action_confirmation_note() -> str:
     return (
         "Перед любым рискованным действием (удаление/перезапуск сервисов/массовые правки) "
-        "сначала запроси у пользователя явное подтверждение, затем выполняй."
+        "сначала запроси у пользователя явное подтверждение, затем выполняй. "
+        "Если пользователь просит перезапустить `personal-assistant-bot.service` из этого же бота, "
+        "не используй первым шагом голый `systemctl restart`; предпочитай "
+        "`python3 -m system.bot.self_restart request`, чтобы рестарт был зафиксирован в состоянии до обрыва процесса."
     )
 
 
@@ -85,6 +89,7 @@ def _workspace_memory_note() -> str:
         "Перед осмыслением шага не тащи память в ответ по памяти и не пересказывай её механически.\n"
         "При необходимости сам открой нужные файлы workspace и опирайся на них как на источник истины:\n"
         f"{memory_files}\n"
+        f"- `{ASSISTANT_CONSTITUTION_PATH}`\n"
         f"- `{AUTONOMY_PLAN_PATH}`\n"
         f"- `{AUTONOMY_JOURNAL_GLOB}`\n"
         f"- `{AUTONOMY_REQUESTS_PATH}`\n"
@@ -134,6 +139,7 @@ def build_autonomy_wakeup_prompt(
     current_task_title: str = "",
     current_task_details: str = "",
     current_task_kind: str = "general",
+    current_task_continuation_count: int = 0,
     active_request_lines: list[str] | None = None,
     recent_task_lines: list[str] | None = None,
     recent_journal_lines: list[str] | None = None,
@@ -155,6 +161,43 @@ def build_autonomy_wakeup_prompt(
     current_task_block = ""
     if current_task_id is not None:
         details_block = current_task_details.strip() or "(без дополнительных деталей)"
+        continuation_block = ""
+        if current_task_continuation_count > 0:
+            continuation_block = (
+                f"- continuation_count: {current_task_continuation_count}\n"
+                "Эта линия уже продолжалась раньше. Не дроби её на новый микрошаг, "
+                "если текущий объём можно честно закрыть прямо сейчас.\n"
+            )
+            if current_task_continuation_count >= 2:
+                continuation_block += (
+                    "Лимит мелких follow-up'ов по этой линии уже практически исчерпан: "
+                    "новый `[[autonomy-next]]` допустим только если без него задача реально "
+                    "технически не помещается в этот проход или есть внешний блокер.\n"
+                )
+        self_review_block = ""
+        if current_task_kind in {"project", "maintenance", "review"}:
+            self_review_block = (
+                "Если этот шаг меняет самого ассистента или его автономный контур "
+                "(код, prompt, owner-facing поведение, память контура), то перед правкой "
+                "сначала коротко зафиксируй для себя 4 вещи: что именно меняешь, зачем, "
+                "главный риск и как проверишь результат. Для этого в конце ответа добавь "
+                "внутренний блок такого вида:\n"
+                "[[self-review]]\n"
+                "CHANGE: ...\n"
+                "WHY: ...\n"
+                "RISK: ...\n"
+                "CHECK: ...\n"
+                "[[/self-review]]\n"
+                "Этот блок нужен для внутреннего следа, не для владельца; не раздувай его "
+                "в полотно и не отправляй владельцу как часть обычного результата.\n"
+                "Если по такому шагу реально нужен owner-facing апдейт в чат, не делай это по умолчанию. "
+                "Добавь в конец ответа отдельный служебный блок:\n"
+                "[[notify-owner]]\n"
+                "REASON: коротко, почему этот шаг действительно стоит показать владельцу\n"
+                "[[/notify-owner]]\n"
+                "Без этого блока внутренний project/maintenance/review шаг лучше считать тихим, "
+                "если там нет прямого вопроса к владельцу или файла для отправки.\n"
+            )
         current_task_block = (
             "Есть текущая автономная задача, её нужно считать главным кандидатом на этот heartbeat.\n"
             "Если можешь, сделай по ней один реальный шаг, а не придумывай другую тему.\n"
@@ -163,6 +206,8 @@ def build_autonomy_wakeup_prompt(
             f"- kind: {current_task_kind}\n"
             f"- title: {current_task_title}\n"
             f"- details: {details_block}\n\n"
+            f"{continuation_block}"
+            f"{self_review_block}"
         )
     return (
         f"{prefix}"
@@ -170,6 +215,9 @@ def build_autonomy_wakeup_prompt(
         "Сделай один осмысленный и безопасный автономный сеанс.\n"
         "Не уходи в бесконечную миссию, не разгоняй self-loop и не делай рискованных действий.\n"
         "Если задача требует продолжения, остановись на хорошем промежуточном результате и либо назначь следующий шаг позже, либо продолжи только если это всё ещё короткий безопасный сеанс.\n"
+        "Не дроби задачу на микрошаги, если её можно честно закрыть в текущем проходе.\n"
+        "Многошаговость допустима только там, где за один проход реально нельзя сделать весь оставшийся кусок без самообмана или где есть внешний блокер.\n"
+        "Если уже делаешь одну и ту же линию не первый раз, предпочти более крупный законченный кусок вместо ещё одного мелкого follow-up.\n"
         "Перед началом коротко осмотрись: учти память, недавние пользовательские сигналы и автономные шаги.\n"
         f"{workspace_memory_note}\n"
         "Если можешь безопасно сделать небольшой ресерч, заметку, сводку или другой конкретный полезный результат, предпочитай это мета-размышлениям.\n"

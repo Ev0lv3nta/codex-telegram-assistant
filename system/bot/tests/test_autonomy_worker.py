@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from system.bot.autonomy_store import AutonomyStore
+from system.bot.autonomy_store import AutonomyStore, AutonomyTask
 from system.bot.autonomy_worker import AutonomyWorker
 from system.bot.autonomy_requests import ensure_autonomy_requests_scaffold
 from system.bot.codex_runner import CodexRunResult
@@ -13,7 +13,12 @@ from system.bot.config import Settings
 from system.bot.queue_store import QueueStore
 
 
-def _make_settings(root: Path, *, autonomy_enabled: bool = True) -> Settings:
+def _make_settings(
+    root: Path,
+    *,
+    autonomy_enabled: bool = True,
+    autonomy_loop_poll_sec: int = 60,
+) -> Settings:
     return Settings(
         assistant_root=root,
         telegram_token="x",
@@ -36,6 +41,7 @@ def _make_settings(root: Path, *, autonomy_enabled: bool = True) -> Settings:
         log_level="INFO",
         autonomy_enabled=autonomy_enabled,
         autonomy_heartbeat_sec=1,
+        autonomy_loop_poll_sec=autonomy_loop_poll_sec,
         autonomy_notify_enabled=False,
         autonomy_notify_min_chars=20,
         autonomy_notify_cooldown_sec=60,
@@ -84,6 +90,119 @@ class _FakeBot:
 
 
 class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_wakes_early_on_new_message_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_loop_poll_sec=3600)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            wake_event = asyncio.Event()
+            runner = _FakeRunner(CodexRunResult(True, "should not run", "session-1"))
+            bot = _FakeBot()
+            worker = AutonomyWorker(
+                settings,
+                queue_store,
+                autonomy_store,
+                bot,
+                runner,
+                stop_event,
+                wake_event=wake_event,
+            )
+
+            try:
+                queue_store.note_chat_activity(101)
+                queue_store.enqueue_task(
+                    chat_id=101,
+                    user_id=1,
+                    username="tester",
+                    text="hello",
+                    attachments=[],
+                )
+                autonomy_store.schedule_next_wakeup_in(101, 3600)
+
+                run_task = asyncio.create_task(worker.run())
+                await asyncio.sleep(0.05)
+                wake_event.set()
+
+                for _ in range(20):
+                    if autonomy_store.get_last_heartbeat_kind() == "skipped_user_pending":
+                        break
+                    await asyncio.sleep(0.05)
+
+                self.assertEqual(autonomy_store.get_last_heartbeat_kind(), "skipped_user_pending")
+                self.assertEqual(len(runner.calls), 0)
+            finally:
+                stop_event.set()
+                wake_event.set()
+                await run_task
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_once_skips_when_autonomy_paused_for_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(CodexRunResult(True, "should not run", "session-1"))
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.set_autonomy_paused(101, True)
+                autonomy_store.enqueue_task(chat_id=101, title="Автономная задача")
+
+                await worker._run_once()
+
+                pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(len(runner.calls), 0)
+                self.assertEqual(autonomy_store.get_mode(101), "stopped")
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_does_not_spin_when_autonomy_paused_and_next_wakeup_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_loop_poll_sec=3600)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            wake_event = asyncio.Event()
+            runner = _FakeRunner(CodexRunResult(True, "should not run", "session-1"))
+            bot = _FakeBot()
+            worker = AutonomyWorker(
+                settings,
+                queue_store,
+                autonomy_store,
+                bot,
+                runner,
+                stop_event,
+                wake_event=wake_event,
+            )
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.set_autonomy_paused(101, True)
+                autonomy_store.clear_next_wakeup(101)
+
+                run_task = asyncio.create_task(worker.run())
+                await asyncio.sleep(0.1)
+
+                self.assertFalse(run_task.done())
+                self.assertEqual(autonomy_store.get_mode(101), "")
+                self.assertEqual(len(runner.calls), 0)
+            finally:
+                stop_event.set()
+                wake_event.set()
+                await run_task
+                queue_store.close()
+                autonomy_store.close()
+
     async def test_run_once_completes_ready_task(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -253,6 +372,11 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(done), 0)
                 self.assertEqual(len(runner.calls), 0)
                 self.assertEqual(autonomy_store.get_last_heartbeat_kind(), "sleeping_scheduled")
+                mission = autonomy_store.get_active_mission(101)
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.title, "Отложенный follow-up")
+                self.assertEqual(mission.scheduled_for, "2099-01-01T00:00:00+00:00")
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -463,8 +587,8 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(bot.messages), 1)
                 self.assertIn("Автономно:", bot.messages[0][1])
                 self.assertIn("Фикс внесён и проверен тестами.", bot.messages[0][1])
-                self.assertNotIn("python3 -m unittest", bot.messages[0][1])
-                self.assertNotIn("Self-check", bot.messages[0][1])
+                self.assertIn("python3 -m unittest", bot.messages[0][1])
+                self.assertIn("Self-check", bot.messages[0][1])
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -504,6 +628,274 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 queue_store.close()
                 autonomy_store.close()
+
+    async def test_run_once_does_not_notify_internal_complete_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            settings = Settings(
+                **{
+                    **settings.__dict__,
+                    "autonomy_notify_enabled": True,
+                    "autonomy_notify_min_chars": 1,
+                    "autonomy_notify_cooldown_sec": 0,
+                }
+            )
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "ACTION: COMPLETE",
+                            "RESULT:",
+                            "Текущую внутреннюю верификационную линию можно закрыть без нового шага.",
+                        ]
+                    ),
+                    "session-2",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Внутренне закрыть хвост")
+
+                await worker._run_once()
+
+                self.assertEqual(bot.messages, [])
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_once_does_not_notify_project_update_without_notify_owner_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            settings = Settings(
+                **{
+                    **settings.__dict__,
+                    "autonomy_notify_enabled": True,
+                    "autonomy_notify_min_chars": 1,
+                    "autonomy_notify_cooldown_sec": 0,
+                }
+            )
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "Сделал внутренний project-шаг и подготовил основу для следующего слоя.",
+                    "session-2",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Тихий project-шаг", kind="project")
+
+                await worker._run_once()
+
+                self.assertEqual(bot.messages, [])
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_once_notifies_project_update_with_notify_owner_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            settings = Settings(
+                **{
+                    **settings.__dict__,
+                    "autonomy_notify_enabled": True,
+                    "autonomy_notify_min_chars": 1,
+                    "autonomy_notify_cooldown_sec": 0,
+                }
+            )
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "Системно приглушил owner-facing шум от внутренних project-закрытий.",
+                            "",
+                            "[[notify-owner]]",
+                            "REASON: Это реально меняет то, что владелец увидит в чате.",
+                            "[[/notify-owner]]",
+                        ]
+                    ),
+                    "session-2",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Шумный project-шаг", kind="project")
+
+                await worker._run_once()
+
+                self.assertEqual(len(bot.messages), 1)
+                self.assertIn("Автономно:", bot.messages[0][1])
+                self.assertIn("Системно приглушил owner-facing шум", bot.messages[0][1])
+                self.assertNotIn("[[notify-owner]]", bot.messages[0][1])
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    def test_owner_notification_text_keeps_multiple_meaningful_lines(self) -> None:
+        task = AutonomyTask(
+            id=1,
+            chat_id=101,
+            kind="research",
+            title="Разобрать Ouroboros",
+            details="",
+            priority=10,
+            status="done",
+            created_at="2026-03-07T20:00:00+00:00",
+            scheduled_for="2026-03-07T20:00:00+00:00",
+            parent_task_id=None,
+            source="assistant",
+            started_at=None,
+            finished_at=None,
+            blocked_user_signal=None,
+            result_text="",
+            error_text="",
+        )
+        text = "\n".join(
+            [
+                "У Ouroboros есть сильные идеи, но почти все они опасны в полном объёме.",
+                "1. Стоит брать жёстко оформленное identity/constitution-ядро.",
+                "2. Стоит брать облегчённый review-контур перед изменениями в себе.",
+                "3. Не стоит брать постоянное background consciousness.",
+            ]
+        )
+
+        result = AutonomyWorker._owner_notification_text(task, text)
+
+        self.assertIn("У Ouroboros есть сильные идеи", result)
+        self.assertIn("1. Стоит брать", result)
+        self.assertIn("2. Стоит брать", result)
+        self.assertIn("3. Не стоит брать", result)
+
+    def test_owner_notification_text_strips_autonomy_control_block(self) -> None:
+        task = AutonomyTask(
+            id=1,
+            chat_id=101,
+            kind="note",
+            title="Подготовить Markdown",
+            details="",
+            priority=10,
+            status="done",
+            created_at="2026-03-07T20:00:00+00:00",
+            scheduled_for="2026-03-07T20:00:00+00:00",
+            parent_task_id=None,
+            source="assistant",
+            started_at=None,
+            finished_at=None,
+            blocked_user_signal=None,
+            result_text="",
+            error_text="",
+        )
+        text = "\n".join(
+            [
+                "Готов чистовой драфт.",
+                "",
+                "[[autonomy-next]]",
+                "ACTION: ENQUEUE",
+                "TITLE: Следующий шаг",
+                "KIND: note",
+                "PRIORITY: 200",
+                "DELAY_SEC: 300",
+                "DETAILS:",
+                "Сделать ещё один шаг.",
+                "[[/autonomy-next]]",
+            ]
+        )
+
+        result = AutonomyWorker._owner_notification_text(task, text)
+
+        self.assertEqual(result, "Готов чистовой драфт.")
+
+    def test_owner_notification_text_strips_self_review_block(self) -> None:
+        task = AutonomyTask(
+            id=1,
+            chat_id=101,
+            kind="project",
+            title="Докрутить pulse",
+            details="",
+            priority=10,
+            status="done",
+            created_at="2026-03-07T20:00:00+00:00",
+            scheduled_for="2026-03-07T20:00:00+00:00",
+            parent_task_id=None,
+            source="assistant",
+            started_at=None,
+            finished_at=None,
+            blocked_user_signal=None,
+            result_text="",
+            error_text="",
+        )
+        text = "\n".join(
+            [
+                "Pulse стал понятнее.",
+                "",
+                "[[self-review]]",
+                "CHANGE: Упростил owner-facing слой.",
+                "WHY: Чтобы не было техшума.",
+                "RISK: Можно скрыть полезную служебную деталь.",
+                "CHECK: Проверить тесты и live refresh.",
+                "[[/self-review]]",
+            ]
+        )
+
+        result = AutonomyWorker._owner_notification_text(task, text)
+
+        self.assertEqual(result, "Pulse стал понятнее.")
+
+    def test_owner_notification_text_strips_notify_owner_block(self) -> None:
+        task = AutonomyTask(
+            id=1,
+            chat_id=101,
+            kind="project",
+            title="Докрутить silent updates",
+            details="",
+            priority=10,
+            status="done",
+            created_at="2026-03-07T20:00:00+00:00",
+            scheduled_for="2026-03-07T20:00:00+00:00",
+            parent_task_id=None,
+            source="assistant",
+            started_at=None,
+            finished_at=None,
+            blocked_user_signal=None,
+            result_text="",
+            error_text="",
+        )
+        text = "\n".join(
+            [
+                "Теперь внутренние project-шаги могут идти тихо.",
+                "",
+                "[[notify-owner]]",
+                "REASON: Это реально заметный owner-facing сдвиг.",
+                "[[/notify-owner]]",
+            ]
+        )
+
+        result = AutonomyWorker._owner_notification_text(task, text)
+
+        self.assertEqual(result, "Теперь внутренние project-шаги могут идти тихо.")
 
     async def test_run_once_sleeps_quietly_when_idle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -618,6 +1010,16 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Нужно уточнение", bot.messages[0][1])
                 waiting = autonomy_store.list_tasks(chat_id=101, statuses={"waiting_user"})
                 self.assertEqual(len(waiting), 1)
+                journal = (
+                    root
+                    / "system"
+                    / "tasks"
+                    / "autonomy_journal"
+                    / datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d.md")
+                )
+                self.assertTrue(journal.exists())
+                journal_text = journal.read_text(encoding="utf-8")
+                self.assertIn("· waiting_user", journal_text)
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -974,7 +1376,7 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 queue_store.close()
                 autonomy_store.close()
 
-    async def test_run_once_enqueues_followup_from_autonomy_control_block(self) -> None:
+    async def test_run_once_reschedules_same_task_from_autonomy_control_block(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             settings = _make_settings(root)
@@ -1013,12 +1415,108 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
 
                 done = autonomy_store.list_tasks(chat_id=101, statuses={"done"})
                 pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
-                self.assertEqual(len(done), 1)
+                self.assertEqual(len(done), 0)
                 self.assertEqual(len(pending), 1)
-                self.assertIn("autonomy-next-task", done[0].result_text)
-                self.assertEqual(pending[0].source, "followup")
-                self.assertEqual(pending[0].parent_task_id, done[0].id)
+                self.assertEqual(pending[0].source, "assistant")
+                self.assertIsNone(pending[0].parent_task_id)
                 self.assertEqual(pending[0].title, "Продолжить короткое исследование")
+                self.assertIn("Сделал первый шаг и подготовил основу.", pending[0].result_text)
+                self.assertEqual(
+                    pending[0].details,
+                    "Проверить еще один источник и сверить вывод.",
+                )
+                journal = (
+                    root
+                    / "system"
+                    / "tasks"
+                    / "autonomy_journal"
+                    / datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d.md")
+                )
+                self.assertTrue(journal.exists())
+                journal_text = journal.read_text(encoding="utf-8")
+                self.assertIn("· continued", journal_text)
+                self.assertIn("Продолжить короткое исследование", journal_text)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_once_suppresses_followup_when_continuation_limit_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            settings = Settings(
+                **{
+                    **settings.__dict__,
+                    "autonomy_max_task_continuations": 2,
+                }
+            )
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "Сделал крупный кусок, но модель всё ещё пытается поставить ещё один follow-up.",
+                            "",
+                            "[[autonomy-next]]",
+                            "ACTION: ENQUEUE",
+                            "TITLE: Ещё один мелкий хвост",
+                            "KIND: project",
+                            "PRIORITY: 20",
+                            "DELAY_SEC: 60",
+                            "DETAILS:",
+                            "Крошечное продолжение, которого уже не должно быть.",
+                            "[[/autonomy-next]]",
+                        ]
+                    ),
+                    "session-6",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                task_id = autonomy_store.enqueue_task(chat_id=101, title="Большая линия", kind="project")
+                autonomy_store.claim_next_ready_task(chat_id=101)
+                autonomy_store.continue_task(
+                    task_id,
+                    title="Большая линия",
+                    details="Первое продолжение",
+                    kind="project",
+                    priority=30,
+                    scheduled_for="2026-03-06T12:00:00+00:00",
+                    progress_text="Первый проход завершён.",
+                )
+                autonomy_store.claim_next_ready_task(chat_id=101, now="2026-03-06T12:00:01+00:00")
+                autonomy_store.continue_task(
+                    task_id,
+                    title="Большая линия",
+                    details="Второе продолжение",
+                    kind="project",
+                    priority=30,
+                    scheduled_for="2026-03-06T12:01:00+00:00",
+                    progress_text="Второй проход завершён.",
+                )
+
+                await worker._run_once()
+
+                pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
+                done = autonomy_store.list_tasks(chat_id=101, statuses={"done"})
+                self.assertEqual(len(pending), 0)
+                self.assertEqual(len(done), 1)
+                self.assertIn("autonomy-followup-suppressed", done[0].result_text)
+                journal = (
+                    root
+                    / "system"
+                    / "tasks"
+                    / "autonomy_journal"
+                    / datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d.md")
+                )
+                self.assertTrue(journal.exists())
+                self.assertIn("· completed", journal.read_text(encoding="utf-8"))
             finally:
                 queue_store.close()
                 autonomy_store.close()

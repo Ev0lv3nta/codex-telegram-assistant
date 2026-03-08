@@ -14,7 +14,7 @@ from .autonomy_journal import (
     append_autonomy_journal_entry,
     read_recent_autonomy_journal_entries,
 )
-from .autonomy_planner import extract_autonomy_continuation, parse_wakeup_decision
+from .autonomy_planner import extract_autonomy_continuation, extract_self_review, parse_wakeup_decision
 from .autonomy_requests import read_active_autonomy_request_summaries
 from .autonomy_store import AutonomyStore, AutonomyTask
 from .codex_runner import CodexRunner
@@ -29,6 +29,10 @@ class AutonomyWorker:
         r"(mainpid|activeentertimestamp|systemctl|сервис\b.*\bactive\b|service\b.*\bactive\b|pid=|heartbeat\b.*\b(жив|ok|active))",
         re.IGNORECASE,
     )
+    _NOTIFY_OWNER_BLOCK_RE = re.compile(
+        r"\n?\[\[notify-owner\]\].*?\[\[/notify-owner\]\]\n?",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     def __init__(
         self,
@@ -38,6 +42,7 @@ class AutonomyWorker:
         bot: Bot,
         runner: CodexRunner,
         stop_event: asyncio.Event,
+        wake_event: asyncio.Event | None = None,
     ) -> None:
         self._settings = settings
         self._queue_store = queue_store
@@ -45,6 +50,7 @@ class AutonomyWorker:
         self._bot = bot
         self._runner = runner
         self._stop_event = stop_event
+        self._wake_event = wake_event or asyncio.Event()
         self._logger = logging.getLogger("assistant.autonomy")
 
     @staticmethod
@@ -95,7 +101,10 @@ class AutonomyWorker:
         lines: list[str] = []
         for task in tasks:
             title = task.title.strip() or "(без названия)"
-            details = (task.result_text or task.error_text or task.details or "").strip()
+            if task.status in {"pending", "running"}:
+                details = (task.details or task.result_text or task.error_text or "").strip()
+            else:
+                details = (task.result_text or task.error_text or task.details or "").strip()
             summary = f"#{task.id} [{task.status}] {title}"
             if details:
                 compact = " ".join(details.split())
@@ -129,6 +138,30 @@ class AutonomyWorker:
             self._settings.assistant_root,
             limit=limit,
         )
+
+    async def _wait_for_stop_or_wakeup(self, timeout_sec: float) -> None:
+        if timeout_sec <= 0:
+            return
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        wake_wait = asyncio.create_task(self._wake_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {stop_wait, wake_wait},
+                timeout=max(0, timeout_sec),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if wake_wait in done:
+                self._wake_event.clear()
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            if not stop_wait.done():
+                stop_wait.cancel()
+            if not wake_wait.done():
+                wake_wait.cancel()
 
     def _has_duplicate_waiting_blocker(self, chat_id: int, text: str) -> bool:
         candidate = self._compact_text(text, limit=500)
@@ -259,51 +292,36 @@ class AutonomyWorker:
 
     @classmethod
     def _owner_notification_text(cls, task: AutonomyTask, text: str) -> str:
-        lines = []
-        for raw_line in (text or "").splitlines():
-            line = raw_line.strip()
-            if not line:
+        clean_text, _ = extract_autonomy_continuation(text or "")
+        clean_text, _ = extract_self_review(clean_text)
+        clean_text, _ = cls._extract_notify_owner(clean_text)
+        lines: list[str] = []
+        for raw_line in clean_text.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                lines.append("")
                 continue
-            lower = line.lower()
-            if lower.startswith(("self-check:", "проверка:", "изменено:", "tests:", "тесты:")):
+            upper = line.strip().upper()
+            if upper in {"ACTION: ENQUEUE", "ACTION: STEP", "ACTION: COMPLETE", "DETAILS:", "RESULT:"}:
                 continue
-            if any(
-                marker in lower
-                for marker in (
-                    "python3 -m unittest",
-                    "[[autonomy-next]]",
-                    "[[/autonomy-next]]",
-                    "delay_sec:",
-                    "priority:",
-                    "kind:",
-                    "details:",
-                    "result:",
-                    "action:",
-                    "следующий хороший шаг",
-                )
-            ):
+            if upper.startswith(("TITLE:", "KIND:", "PRIORITY:", "DELAY_SEC:")):
                 continue
-            if line.startswith("- "):
-                payload = line[2:].strip()
-                if "/" in payload or "`" in payload:
-                    continue
-                line = payload
             lines.append(line)
+        return "\n".join(lines).strip()
 
-        if task.status == "waiting_user":
-            for line in lines:
-                if "?" in line:
-                    return cls._compact_text(line, limit=280)
+    @classmethod
+    def _extract_notify_owner(cls, text: str) -> tuple[str, bool]:
+        raw = text or ""
+        has_marker = "[[notify-owner]]" in raw.lower()
+        clean = cls._NOTIFY_OWNER_BLOCK_RE.sub("\n", raw)
+        clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+        return clean, has_marker
 
-        if lines:
-            summary = lines[0]
-            if task.status != "waiting_user" and len(lines) > 1:
-                candidate = cls._compact_text(lines[1], limit=140)
-                if candidate and len(candidate) < 120 and "/" not in candidate and "`" not in candidate:
-                    summary = f"{summary} {candidate}"
-            return cls._compact_text(summary, limit=280)
-
-        return cls._compact_text(text, limit=280)
+    @staticmethod
+    def _is_internal_complete_closure(raw_message: str, *, file_paths: list[str]) -> bool:
+        if file_paths:
+            return False
+        return (raw_message or "").strip().upper().startswith("ACTION: COMPLETE")
 
     @staticmethod
     def _scheduled_after(delay_sec: int) -> str:
@@ -324,6 +342,7 @@ class AutonomyWorker:
         suffix: str,
         followup_id: int | None = None,
         followup_delay_sec: int = 0,
+        self_reviews: list[str] | None = None,
     ) -> str:
         chunks: list[str] = []
         text = clean_message.strip()
@@ -335,7 +354,23 @@ class AutonomyWorker:
             )
         if suffix.strip():
             chunks.append(suffix.strip())
+        if self_reviews:
+            chunks.extend(item.strip() for item in self_reviews if item.strip())
         return "\n\n".join(chunks).strip()
+
+    @staticmethod
+    def _format_self_review_block(change: str, why: str, risk: str, check: str) -> str:
+        lines = ["[[self-review]]"]
+        if change.strip():
+            lines.append(f"CHANGE: {change.strip()}")
+        if why.strip():
+            lines.append(f"WHY: {why.strip()}")
+        if risk.strip():
+            lines.append(f"RISK: {risk.strip()}")
+        if check.strip():
+            lines.append(f"CHECK: {check.strip()}")
+        lines.append("[[/self-review]]")
+        return "\n".join(lines)
 
     async def run(self) -> None:
         if not self._settings.autonomy_enabled:
@@ -345,16 +380,16 @@ class AutonomyWorker:
             timeout_sec = self._settings.autonomy_loop_poll_sec
             chat_id = self._queue_store.get_last_active_chat_id()
             if chat_id is not None:
-                until_due = self._autonomy_store.seconds_until_next_wakeup(chat_id)
-                if until_due is None or until_due <= 0:
-                    timeout_sec = 0
-                else:
-                    timeout_sec = min(timeout_sec, until_due)
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=max(0, timeout_sec),
-                )
+                # When autonomy is explicitly stopped, `next_wakeup` is cleared.
+                # Treat that state as "sleep until wake_event / periodic poll",
+                # not as "wake immediately", otherwise the loop spins hot.
+                if not self._autonomy_store.autonomy_paused(chat_id):
+                    until_due = self._autonomy_store.seconds_until_next_wakeup(chat_id)
+                    if until_due is None or until_due <= 0:
+                        timeout_sec = 0
+                    else:
+                        timeout_sec = min(timeout_sec, until_due)
+            await self._wait_for_stop_or_wakeup(timeout_sec)
             if self._stop_event.is_set():
                 return
             await self._run_once()
@@ -363,6 +398,9 @@ class AutonomyWorker:
         chat_id = self._queue_store.get_last_active_chat_id()
         if chat_id is None:
             self._logger.debug("Autonomy heartbeat skipped: no active chat")
+            return
+        if self._autonomy_store.autonomy_paused(chat_id):
+            self._autonomy_store.set_mode(chat_id, "stopped")
             return
         current_signal = self._queue_store.get_user_signal(chat_id)
         force_wakeup = current_signal > self._autonomy_store.get_last_seen_user_signal(chat_id)
@@ -427,8 +465,19 @@ class AutonomyWorker:
                 )
                 if handled_idle:
                     return
-                next_pending_at = self._autonomy_store.get_next_pending_scheduled_for(chat_id)
+                next_pending = self._autonomy_store.get_next_pending_task(chat_id)
+                next_pending_at = next_pending.scheduled_for if next_pending is not None else ""
                 if next_pending_at:
+                    self._autonomy_store.set_active_mission(
+                        chat_id,
+                        task_id=next_pending.id,
+                        title=next_pending.title,
+                        details=next_pending.details,
+                        kind=next_pending.kind,
+                        source=next_pending.source,
+                        phase="scheduled",
+                        scheduled_for=next_pending_at,
+                    )
                     self._schedule_mode(chat_id, "sleeping_scheduled", at=next_pending_at)
                     self._autonomy_store.mark_heartbeat("sleeping_scheduled")
                     return
@@ -537,6 +586,7 @@ class AutonomyWorker:
         current_kind = task.kind if task is not None else "general"
         current_priority = task.priority if task is not None else 100
         step_results: list[str] = []
+        step_self_reviews: list[str] = []
         parsed_texts: list[str] = []
 
         self._autonomy_store.set_active_mission(
@@ -546,6 +596,8 @@ class AutonomyWorker:
             details=current_details,
             kind=current_kind,
             source=persisted_task_source,
+            phase="running",
+            scheduled_for=task.scheduled_for if task is not None else "",
         )
 
         for step_index in range(self._settings.autonomy_session_step_limit):
@@ -554,6 +606,7 @@ class AutonomyWorker:
                 current_task_title=current_title,
                 current_task_details=current_details,
                 current_task_kind=current_kind,
+                current_task_continuation_count=current_task.continuation_count if current_task is not None else 0,
                 active_request_lines=active_request_lines,
                 recent_task_lines=self._recent_task_lines(chat_id),
                 recent_journal_lines=self._recent_journal_lines(),
@@ -593,6 +646,7 @@ class AutonomyWorker:
                 return
 
             clean_message, continuation = extract_autonomy_continuation(result.message or "")
+            clean_message, self_review = extract_self_review(clean_message)
             decision = parse_wakeup_decision(clean_message)
             if (
                 decision.action != "STEP"
@@ -635,6 +689,7 @@ class AutonomyWorker:
                 stored = self._compose_stored_result(
                     final_text,
                     suffix=suffix,
+                    self_reviews=step_self_reviews,
                 )
                 self._autonomy_store.complete_task(persisted_task_id, stored)
                 self._autonomy_store.clear_active_mission(chat_id)
@@ -686,6 +741,8 @@ class AutonomyWorker:
                         details=current_details,
                         kind=current_kind,
                         source=persisted_task_source,
+                        phase="scheduled" if current_task is not None and current_task.scheduled_for else "running",
+                        scheduled_for=current_task.scheduled_for if current_task is not None else "",
                     )
                 self._schedule_mode(
                     chat_id,
@@ -702,6 +759,15 @@ class AutonomyWorker:
             effective_details = decision.details.strip() or current_details
             effective_priority = decision.priority
             result_text = decision.result_text.strip() or clean_message.strip()
+            if self_review is not None:
+                step_self_reviews.append(
+                    self._format_self_review_block(
+                        self_review.change,
+                        self_review.why,
+                        self_review.risk,
+                        self_review.check,
+                    )
+                )
             blocks_on_user = self._needs_user_response_pause(result_text)
 
             if (
@@ -734,6 +800,8 @@ class AutonomyWorker:
                 details=effective_details,
                 kind=effective_kind,
                 source=persisted_task_source,
+                phase="running",
+                scheduled_for=current_task.scheduled_for if current_task is not None else "",
             )
 
             current_title = effective_title
@@ -749,13 +817,27 @@ class AutonomyWorker:
                 final_text = "\n\n".join(step_results).strip()
                 self._autonomy_store.wait_for_user(
                     persisted_task_id,
-                    self._compose_stored_result(final_text, suffix=suffix),
+                    self._compose_stored_result(
+                        final_text,
+                        suffix=suffix,
+                        self_reviews=step_self_reviews,
+                    ),
                     user_signal=baseline_signal,
                 )
                 self._schedule_mode(
                     chat_id,
                     "waiting_user",
                     delay_sec=self._settings.autonomy_idle_sleep_sec,
+                )
+                self._autonomy_store.set_active_mission(
+                    chat_id,
+                    task_id=persisted_task_id,
+                    title=current_title,
+                    details=current_details,
+                    kind=current_kind,
+                    source=persisted_task_source,
+                    phase="waiting_user",
+                    scheduled_for="",
                 )
                 await self._maybe_notify_completion(
                     chat_id=chat_id,
@@ -768,7 +850,7 @@ class AutonomyWorker:
                         priority=current_priority,
                         status="waiting_user",
                         created_at=task.created_at if task is not None else "",
-                        scheduled_for=task.scheduled_for if task is not None else "",
+                        scheduled_for="",
                         parent_task_id=persisted_parent_id,
                         source=persisted_task_source,
                         started_at=task.started_at if task is not None else None,
@@ -786,7 +868,9 @@ class AutonomyWorker:
                     "waiting_after_user_interrupt" if user_signal_changed else "waiting_user"
                 )
                 summary = parsed.text or final_text
-                self._journal("completed", current_title, summary, task_id=persisted_task_id)
+                if user_signal_changed:
+                    summary += " Во время шага пришло сообщение владельца."
+                self._journal("waiting_user", current_title, summary, task_id=persisted_task_id)
                 return
 
             inline_continue = (
@@ -802,38 +886,77 @@ class AutonomyWorker:
                 current_priority = continuation.priority
                 continue
 
-            followup_id: int | None = None
-            if continuation is not None and not user_signal_changed:
+            final_text = "\n\n".join(step_results).strip()
+            continued_task = False
+            notification_task_status = "done"
+            notification_task_scheduled_for = ""
+            journal_status = "completed"
+            continuation_limit_reached = (
+                current_task is not None
+                and current_task.continuation_count >= self._settings.autonomy_max_task_continuations
+            )
+            if continuation is not None and not user_signal_changed and continuation_limit_reached:
+                final_text = (
+                    f"{final_text}\n\n[autonomy-followup-suppressed: continuation limit reached]"
+                ).strip()
+
+            if (
+                continuation is not None
+                and not user_signal_changed
+                and not continuation_limit_reached
+            ):
                 followup_delay_sec = max(1, continuation.delay_sec)
-                followup_id = self._autonomy_store.enqueue_task(
-                    chat_id=chat_id,
-                    title=continuation.title,
-                    details=continuation.details,
-                    kind=continuation.kind,
-                    priority=continuation.priority,
-                    scheduled_for=self._scheduled_after(followup_delay_sec),
-                    parent_task_id=persisted_parent_id if persisted_parent_id is not None else persisted_task_id,
-                    source="followup",
+                next_title = continuation.title.strip() or current_title
+                next_details = continuation.details.strip() or current_details
+                next_kind = continuation.kind.strip() or current_kind
+                next_priority = continuation.priority
+                next_scheduled_for = self._scheduled_after(followup_delay_sec)
+                self._autonomy_store.continue_task(
+                    persisted_task_id,
+                    title=next_title,
+                    details=next_details,
+                    kind=next_kind,
+                    priority=next_priority,
+                    scheduled_for=next_scheduled_for,
+                    progress_text=self._compose_stored_result(
+                        final_text,
+                        suffix=suffix,
+                        self_reviews=step_self_reviews,
+                    ),
+                )
+                self._autonomy_store.set_active_mission(
+                    chat_id,
+                    task_id=persisted_task_id,
+                    title=next_title,
+                    details=next_details,
+                    kind=next_kind,
+                    source=persisted_task_source,
+                    phase="scheduled",
+                    scheduled_for=next_scheduled_for,
                 )
                 self._schedule_mode(chat_id, "sleeping_scheduled", delay_sec=followup_delay_sec)
+                continued_task = True
+                current_title = next_title
+                current_details = next_details
+                current_kind = next_kind
+                current_priority = next_priority
+                notification_task_status = "pending"
+                notification_task_scheduled_for = next_scheduled_for
+                journal_status = "continued"
             else:
                 self._schedule_mode(
                     chat_id,
                     "cooldown" if active_request_lines else "idle",
                     delay_sec=self._settings.autonomy_default_sleep_sec,
                 )
-
-            final_text = "\n\n".join(step_results).strip()
-            self._autonomy_store.complete_task(
-                persisted_task_id,
-                self._compose_stored_result(
-                    final_text,
-                    suffix=suffix,
-                    followup_id=followup_id,
-                    followup_delay_sec=max(1, continuation.delay_sec) if continuation else 0,
-                ),
-            )
-            if followup_id is None:
+                self._autonomy_store.complete_task(
+                    persisted_task_id,
+                    self._compose_stored_result(
+                        final_text,
+                        suffix=suffix,
+                        self_reviews=step_self_reviews,
+                    ),
+                )
                 self._autonomy_store.clear_active_mission(chat_id)
             await self._maybe_notify_completion(
                 chat_id=chat_id,
@@ -844,9 +967,9 @@ class AutonomyWorker:
                     title=current_title,
                     details=current_details,
                     priority=current_priority,
-                    status="done",
+                    status=notification_task_status,
                     created_at=task.created_at if task is not None else "",
-                    scheduled_for=task.scheduled_for if task is not None else "",
+                    scheduled_for=notification_task_scheduled_for,
                     parent_task_id=persisted_parent_id,
                     source=persisted_task_source,
                     started_at=task.started_at if task is not None else None,
@@ -863,14 +986,14 @@ class AutonomyWorker:
             self._autonomy_store.mark_heartbeat(
                 "completed_after_user_interrupt"
                 if user_signal_changed
-                else ("completed_continued" if followup_id is not None else "completed")
+                else ("completed_continued" if continued_task else "completed")
             )
             summary = "\n\n".join(parsed_texts).strip() or final_text or "Автономный шаг завершился без текстового результата."
-            if followup_id is not None:
-                summary += f" Дальше поставлен follow-up шаг #{followup_id}."
+            if continued_task:
+                summary += " Дальше продолжение этой же задачи уже запланировано."
             if user_signal_changed:
                 summary += " Во время шага пришло сообщение владельца."
-            self._journal("completed", current_title, summary, task_id=persisted_task_id)
+            self._journal(journal_status, current_title, summary, task_id=persisted_task_id)
             return
 
     async def _maybe_notify_completion(
@@ -896,12 +1019,22 @@ class AutonomyWorker:
         clean_text = text.strip()
         min_chars = max(1, self._settings.autonomy_notify_min_chars)
         looks_like_question = clean_text.endswith("?") or clean_text.endswith("؟")
+        _, notify_owner = self._extract_notify_owner(raw_message)
         should_notify = (
             bool(file_paths)
             or len(clean_text) >= min_chars
             or (looks_like_question and bool(clean_text))
         )
         if not should_notify:
+            return
+        if self._is_internal_complete_closure(raw_message, file_paths=file_paths):
+            return
+        if (
+            task.kind in {"project", "maintenance", "review"}
+            and not file_paths
+            and not looks_like_question
+            and not notify_owner
+        ):
             return
         if self._is_low_value_notification(task, clean_text):
             return

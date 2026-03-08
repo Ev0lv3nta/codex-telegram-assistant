@@ -37,6 +37,7 @@ class AutonomyTask:
     blocked_user_signal: int | None
     result_text: str
     error_text: str
+    continuation_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,8 @@ class ActiveMission:
     details: str
     kind: str
     source: str
+    phase: str
+    scheduled_for: str
 
 
 class AutonomyStore:
@@ -78,6 +81,7 @@ class AutonomyStore:
                     started_at TEXT,
                     finished_at TEXT,
                     blocked_user_signal INTEGER,
+                    continuation_count INTEGER NOT NULL DEFAULT 0,
                     result_text TEXT NOT NULL DEFAULT '',
                     error_text TEXT NOT NULL DEFAULT ''
                 )
@@ -98,6 +102,10 @@ class AutonomyStore:
             if "blocked_user_signal" not in columns:
                 self._conn.execute(
                     "ALTER TABLE autonomy_tasks ADD COLUMN blocked_user_signal INTEGER"
+                )
+            if "continuation_count" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_tasks ADD COLUMN continuation_count INTEGER NOT NULL DEFAULT 0"
                 )
             self._conn.execute(
                 """
@@ -290,6 +298,46 @@ class AutonomyStore:
                 (when, priority, task_id),
             )
 
+    def continue_task(
+        self,
+        task_id: int,
+        *,
+        title: str,
+        details: str,
+        kind: str,
+        priority: int,
+        scheduled_for: str,
+        progress_text: str = "",
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE autonomy_tasks
+                SET title = ?,
+                    details = ?,
+                    kind = ?,
+                    priority = ?,
+                    status = 'pending',
+                    scheduled_for = ?,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    blocked_user_signal = NULL,
+                    continuation_count = continuation_count + 1,
+                    result_text = ?,
+                    error_text = ''
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    details,
+                    kind,
+                    priority,
+                    scheduled_for,
+                    progress_text,
+                    task_id,
+                ),
+            )
+
     def resume_waiting_tasks(self, chat_id: int, *, user_signal: int, now: str | None = None) -> int:
         effective_now = now or _utc_now()
         with self._lock, self._conn:
@@ -368,6 +416,22 @@ class AutonomyStore:
         if row is None:
             return ""
         return str(row["scheduled_for"] or "")
+
+    def get_next_pending_task(self, chat_id: int) -> AutonomyTask | None:
+        row = self._conn.execute(
+            """
+            SELECT *
+            FROM autonomy_tasks
+            WHERE chat_id = ?
+              AND status = 'pending'
+            ORDER BY scheduled_for ASC, priority ASC, id ASC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task(row)
 
     def list_tasks(
         self,
@@ -491,6 +555,8 @@ class AutonomyStore:
         kind: str,
         source: str,
         task_id: int | None = None,
+        phase: str = "",
+        scheduled_for: str = "",
     ) -> None:
         payload = {
             "task_id": task_id,
@@ -498,6 +564,8 @@ class AutonomyStore:
             "details": details.strip(),
             "kind": kind.strip() or "general",
             "source": source.strip() or "assistant",
+            "phase": phase.strip(),
+            "scheduled_for": scheduled_for.strip(),
         }
         self.set_meta(
             f"mission:{chat_id}",
@@ -518,6 +586,8 @@ class AutonomyStore:
             details=str(payload.get("details") or ""),
             kind=str(payload.get("kind") or "general"),
             source=str(payload.get("source") or "assistant"),
+            phase=str(payload.get("phase") or ""),
+            scheduled_for=str(payload.get("scheduled_for") or ""),
         )
 
     def clear_active_mission(self, chat_id: int) -> None:
@@ -614,6 +684,12 @@ class AutonomyStore:
             return False
         return effective_now < snoozed_until
 
+    def set_autonomy_paused(self, chat_id: int, paused: bool) -> None:
+        self.set_meta(f"autonomy:paused:{chat_id}", "1" if paused else "0")
+
+    def autonomy_paused(self, chat_id: int) -> bool:
+        return self.get_meta(f"autonomy:paused:{chat_id}", "0") == "1"
+
     @staticmethod
     def _row_to_task(row: sqlite3.Row | dict[str, object]) -> AutonomyTask:
         return AutonomyTask(
@@ -635,6 +711,7 @@ class AutonomyStore:
             else None,
             result_text=str(row["result_text"] or ""),
             error_text=str(row["error_text"] or ""),
+            continuation_count=int(row["continuation_count"] or 0),
         )
 
     def close(self) -> None:

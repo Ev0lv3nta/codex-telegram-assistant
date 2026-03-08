@@ -6,10 +6,20 @@ from types import SimpleNamespace
 from system.bot.autonomy_store import AutonomyStore
 from system.bot.config import Settings
 from system.bot.main import (
+    _allowed_update_types,
+    _build_bot_commands,
+    _build_pulse_keyboard,
     _delete_attachment_file,
+    _enqueue_restart_success_task,
     _note_chat_activity_from_message,
+    _note_passive_owner_touch,
+    _stop_autonomy_now,
+    _render_autonomy_pulse,
+    _schedule_autonomy_snooze,
+    _nudge_autonomy_wakeup,
     _render_autonomy_status,
     _transcribe_voice_if_needed,
+    _wake_autonomy_now,
 )
 from system.bot.queue_store import QueueStore
 from system.bot.stt_openrouter import SttResult
@@ -151,8 +161,138 @@ class ChatActivityTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_nudge_autonomy_wakeup_sets_next_wakeup_and_event(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = AutonomyStore(root / "state.db")
+            wake_event = SimpleNamespace(set_called=False)
+
+            class _WakeEvent:
+                def set(self_inner) -> None:
+                    wake_event.set_called = True
+
+            try:
+                message = SimpleNamespace(chat=SimpleNamespace(id=202))
+                _nudge_autonomy_wakeup(store, message, _WakeEvent())
+                self.assertTrue(wake_event.set_called)
+                self.assertTrue(store.get_next_wakeup(202))
+            finally:
+                store.close()
+
+    def test_nudge_autonomy_wakeup_is_noop_when_autonomy_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = AutonomyStore(root / "state.db")
+            wake_event = SimpleNamespace(set_called=False)
+
+            class _WakeEvent:
+                def set(self_inner) -> None:
+                    wake_event.set_called = True
+
+            try:
+                store.set_autonomy_paused(202, True)
+                message = SimpleNamespace(chat=SimpleNamespace(id=202))
+                _nudge_autonomy_wakeup(store, message, _WakeEvent())
+                self.assertFalse(wake_event.set_called)
+                self.assertEqual(store.get_next_wakeup(202), "")
+            finally:
+                store.close()
+
+    def test_note_passive_owner_touch_does_not_change_next_wakeup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            queue_store = QueueStore(root / "queue.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            try:
+                autonomy_store.set_next_wakeup(202, "2026-03-08T00:10:00+00:00")
+                message = SimpleNamespace(chat=SimpleNamespace(id=202))
+                _note_passive_owner_touch(queue_store, message)
+                self.assertEqual(queue_store.get_last_active_chat_id(), 202)
+                self.assertEqual(
+                    autonomy_store.get_next_wakeup(202),
+                    "2026-03-08T00:10:00+00:00",
+                )
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    def test_schedule_autonomy_snooze_sets_sleeping_idle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = AutonomyStore(root / "state.db")
+            try:
+                until = _schedule_autonomy_snooze(store, 202, hours=6)
+                self.assertEqual(store.get_idle_snooze_until(202), until)
+                self.assertEqual(store.get_next_wakeup(202), until)
+                self.assertEqual(store.get_mode(202), "sleeping_idle")
+            finally:
+                store.close()
+
+    def test_stop_and_wake_autonomy_toggle_pause_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = AutonomyStore(root / "state.db")
+            try:
+                _stop_autonomy_now(store, 202)
+                self.assertTrue(store.autonomy_paused(202))
+                self.assertEqual(store.get_mode(202), "stopped")
+                self.assertEqual(store.get_next_wakeup(202), "")
+
+                _wake_autonomy_now(store, 202)
+                self.assertFalse(store.autonomy_paused(202))
+                self.assertEqual(store.get_mode(202), "idle")
+                self.assertTrue(store.get_next_wakeup(202))
+            finally:
+                store.close()
+
+    def test_enqueue_restart_success_task_creates_system_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = QueueStore(root / "state.db")
+            try:
+                task_id = _enqueue_restart_success_task(store, 202, "demo.service")
+                self.assertGreater(task_id, 0)
+                task = store.claim_next_task()
+                assert task is not None
+                self.assertEqual(task.chat_id, 202)
+                self.assertEqual(task.user_id, 0)
+                self.assertEqual(task.username, "system")
+                self.assertIn("self-restart `demo.service`", task.text)
+            finally:
+                store.close()
+
 
 class AutonomyStatusRenderTests(unittest.TestCase):
+    def test_build_bot_commands_includes_pulse(self) -> None:
+        commands = _build_bot_commands()
+        self.assertEqual([item.command for item in commands], ["start", "pulse", "status", "autonomy", "restart"])
+
+    def test_allowed_update_types_include_callback_query(self) -> None:
+        self.assertEqual(_allowed_update_types(), ["message", "callback_query"])
+
+    def test_build_pulse_keyboard_has_refresh_button(self) -> None:
+        markup = _build_pulse_keyboard()
+        self.assertEqual(len(markup.inline_keyboard), 4)
+        refresh_button = markup.inline_keyboard[0][0]
+        self.assertEqual(refresh_button.text, "Обновить pulse")
+        self.assertEqual(refresh_button.callback_data, "autonomy:pulse")
+        snooze_button = markup.inline_keyboard[1][0]
+        wake_button = markup.inline_keyboard[2][0]
+        stop_button = markup.inline_keyboard[3][0]
+        self.assertEqual(snooze_button.text, "Пауза 6ч")
+        self.assertEqual(snooze_button.callback_data, "autonomy:pulse:snooze:6h")
+        self.assertEqual(wake_button.text, "Разбудить сейчас")
+        self.assertEqual(wake_button.callback_data, "autonomy:pulse:wake:now")
+        self.assertEqual(stop_button.text, "Остановить автономность")
+        self.assertEqual(stop_button.callback_data, "autonomy:pulse:stop")
+
+    def test_build_pulse_keyboard_shows_start_when_stopped(self) -> None:
+        markup = _build_pulse_keyboard(stopped=True)
+        self.assertEqual(len(markup.inline_keyboard), 2)
+        start_button = markup.inline_keyboard[1][0]
+        self.assertEqual(start_button.text, "Запустить автономность")
+        self.assertEqual(start_button.callback_data, "autonomy:pulse:start")
+
     def test_render_autonomy_status_includes_meta_and_followup_chain(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = AutonomyStore(Path(td) / "state.db")
@@ -177,6 +317,137 @@ class AutonomyStatusRenderTests(unittest.TestCase):
                 self.assertIn("last notify:", text)
                 self.assertIn("src=followup", text)
                 self.assertIn(f"parent={parent_id}", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_is_short_and_owner_facing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "sleeping_scheduled")
+                store.set_next_wakeup(101, "2026-03-08T00:10:00+00:00")
+                store.set_active_mission(
+                    101,
+                    task_id=7,
+                    title="Собрать owner-facing слой состояния",
+                    details="Один спокойный шаг",
+                    kind="project",
+                    source="assistant",
+                    phase="running",
+                )
+                store.enqueue_task(
+                    chat_id=101,
+                    title="Продолжить owner-facing слой состояния",
+                    kind="project",
+                    scheduled_for="2026-03-08T00:10:00+00:00",
+                )
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("Пульс автономности:", text)
+                self.assertIn("режим: sleeping_scheduled", text)
+                self.assertIn("следующий wake-up: 08.03 03:10 MSK", text)
+                self.assertIn("текущая линия: Собрать owner-facing слой состояния", text)
+                self.assertIn("есть запланированное продолжение", text)
+                self.assertNotIn("src=", text)
+                self.assertNotIn("parent=", text)
+                self.assertNotIn("2026-03-08T00:10:00+00:00", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_uses_next_pending_step_when_no_active_mission(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "sleeping_scheduled")
+                store.set_next_wakeup(101, "2026-03-08T00:15:00+00:00")
+                store.enqueue_task(
+                    chat_id=101,
+                    title="Проверить живой pulse после рестарта",
+                    kind="project",
+                    scheduled_for="2026-03-08T00:15:00+00:00",
+                )
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("следующий шаг: Проверить живой pulse после рестарта", text)
+                self.assertNotIn("текущая линия: (нет активной миссии)", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_uses_scheduled_active_mission_as_next_step(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "sleeping_scheduled")
+                store.set_next_wakeup(101, "2026-03-08T00:15:00+00:00")
+                store.set_active_mission(
+                    101,
+                    task_id=7,
+                    title="Продолжить реализацию active mission",
+                    details="Вернуться после паузы",
+                    kind="project",
+                    source="assistant",
+                    phase="scheduled",
+                    scheduled_for="2026-03-08T00:15:00+00:00",
+                )
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("следующий шаг: Продолжить реализацию active mission", text)
+                self.assertNotIn("текущая линия: Продолжить реализацию active mission", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_shows_stopped_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_autonomy_paused(101, True)
+                store.set_mode(101, "stopped")
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("режим: stopped", text)
+                self.assertIn("следующий wake-up: (остановлен)", text)
+                self.assertIn("автономный контур остановлен", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_shows_snoozed_until_for_sleeping_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "sleeping_idle")
+                store.set_next_wakeup(101, "2026-03-08T03:00:00+00:00")
+                store.mark_idle_snooze_until(101, "2026-03-08T03:00:00+00:00")
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("статус: притушен до 08.03 06:00 MSK", text)
+                self.assertNotIn("явного автономного хвоста сейчас нет", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_prefers_waiting_phase_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "waiting_user")
+                store.set_active_mission(
+                    101,
+                    task_id=9,
+                    title="Уточнить следующий шаг у владельца",
+                    details="Нужно дождаться ответа",
+                    kind="project",
+                    source="assistant",
+                    phase="waiting_user",
+                )
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("текущая линия: Уточнить следующий шаг у владельца", text)
+                self.assertIn("статус: ждёт ответа владельца", text)
             finally:
                 store.close()
 

@@ -56,10 +56,11 @@ class Settings:
     log_level: str
     autonomy_enabled: bool = False
     autonomy_heartbeat_sec: int = 300
-    autonomy_loop_poll_sec: int = 60
+    autonomy_loop_poll_sec: int = 1800
     autonomy_default_sleep_sec: int = 7200
     autonomy_busy_retry_sec: int = 120
     autonomy_session_step_limit: int = 4
+    autonomy_max_task_continuations: int = 5
     autonomy_notify_enabled: bool = False
     autonomy_notify_min_chars: int = 220
     autonomy_notify_cooldown_sec: int = 10800
@@ -120,6 +121,9 @@ class Settings:
             ),
             autonomy_session_step_limit=_parse_int(
                 os.getenv("AUTONOMY_SESSION_STEP_LIMIT"), 4
+            ),
+            autonomy_max_task_continuations=_parse_int(
+                os.getenv("AUTONOMY_MAX_TASK_CONTINUATIONS"), 5
             ),
             autonomy_notify_enabled=_parse_bool(os.getenv("AUTONOMY_NOTIFY_ENABLED"), False),
             autonomy_notify_min_chars=_parse_int(os.getenv("AUTONOMY_NOTIFY_MIN_CHARS"), 220),
