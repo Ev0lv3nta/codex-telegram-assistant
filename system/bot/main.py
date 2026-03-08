@@ -282,7 +282,8 @@ def _render_autonomy_status(
     heartbeat_at = autonomy_store.get_last_heartbeat_at()
     mode = autonomy_store.get_mode(chat_id) or "(не задан)"
     next_wakeup = autonomy_store.get_next_wakeup(chat_id) or "(не задан)"
-    mission = autonomy_store.get_active_mission(chat_id)
+    active_phase = autonomy_store.get_active_mission(chat_id)
+    mission = autonomy_store.get_live_mission(chat_id)
     notify_last_sent = autonomy_store.get_notify_last_sent(chat_id) or "(не было)"
     lines = [
         "Автономность:",
@@ -298,8 +299,26 @@ def _render_autonomy_status(
         f"- next heartbeat: {_format_eta_from_heartbeat(heartbeat_at, heartbeat_sec)}",
         f"- last notify: {notify_last_sent}",
     ]
-    if mission is not None and mission.title.strip():
-        lines.append(f"- active mission: {mission.title} ({mission.kind})")
+    if mission is not None:
+        lines.append(f"- root mission: {mission.root_objective}")
+        lines.append(f"- mission status: {mission.status}")
+        if mission.plan_state == "staged":
+            lines.append("- mission plan: staged")
+            stages = mission.plan_json or []
+            current_stage = None
+            next_stage = None
+            if 0 <= mission.current_stage_index < len(stages):
+                current_stage = stages[mission.current_stage_index]
+            if 0 <= mission.current_stage_index + 1 < len(stages):
+                next_stage = stages[mission.current_stage_index + 1]
+            if current_stage and str(current_stage.get("title", "")).strip():
+                lines.append(f"- current stage: {str(current_stage.get('title', '')).strip()}")
+            if next_stage and str(next_stage.get("title", "")).strip():
+                lines.append(f"- next stage: {str(next_stage.get('title', '')).strip()}")
+        if mission.current_focus.strip():
+            lines.append(f"- mission focus: {mission.current_focus}")
+        if active_phase is not None and active_phase.phase.strip():
+            lines.append(f"- mission phase: {active_phase.phase}")
     if not tasks:
         lines.append("- recent: (нет задач)")
         return "\n".join(lines)
@@ -321,7 +340,8 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
     stopped = autonomy_store.autonomy_paused(chat_id)
     next_wakeup_raw = autonomy_store.get_next_wakeup(chat_id) or "(не задан)"
     idle_snooze_raw = autonomy_store.get_idle_snooze_until(chat_id) or ""
-    mission = autonomy_store.get_active_mission(chat_id)
+    active_phase = autonomy_store.get_active_mission(chat_id)
+    mission = autonomy_store.get_live_mission(chat_id)
     next_pending = autonomy_store.get_next_pending_task(chat_id)
     next_wakeup = (
         _format_owner_moment(next_wakeup_raw)
@@ -335,11 +355,33 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
         f"- режим: {'stopped' if stopped else mode}",
         f"- следующий wake-up: {'(остановлен)' if stopped else next_wakeup}",
     ]
-    if mission is not None and mission.title.strip():
-        if mission.phase == "scheduled" and mission.scheduled_for:
-            lines.append(f"- следующий шаг: {mission.title}")
+    if mission is not None:
+        lines.append(f"- корневая миссия: {mission.root_objective}")
+        if mission.plan_state == "staged":
+            stages = mission.plan_json or []
+            current_stage = None
+            next_stage = None
+            if 0 <= mission.current_stage_index < len(stages):
+                current_stage = stages[mission.current_stage_index]
+            if 0 <= mission.current_stage_index + 1 < len(stages):
+                next_stage = stages[mission.current_stage_index + 1]
+            if current_stage and str(current_stage.get("title", "")).strip():
+                lines.append(f"- текущий этап: {str(current_stage.get('title', '')).strip()}")
+            if next_stage and str(next_stage.get("title", "")).strip():
+                lines.append(f"- следующий этап: {str(next_stage.get('title', '')).strip()}")
+        focus = ""
+        if active_phase is not None and active_phase.title.strip():
+            focus = active_phase.title
+        elif mission.current_focus.strip():
+            focus = mission.current_focus
+        if focus:
+            lines.append(f"- текущий фокус: {focus}")
+            lines.append(f"- текущая линия: {focus}")
+    elif active_phase is not None and active_phase.title.strip():
+        if active_phase.phase == "scheduled" and active_phase.scheduled_for:
+            lines.append(f"- следующий шаг: {active_phase.title}")
         else:
-            lines.append(f"- текущая линия: {mission.title}")
+            lines.append(f"- текущая линия: {active_phase.title}")
     elif next_pending is not None and next_pending.title.strip():
         lines.append(f"- следующий шаг: {next_pending.title}")
     else:
@@ -349,16 +391,30 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
         lines.append("- статус: автономный контур остановлен")
     elif mode == "sleeping_idle" and idle_snooze:
         lines.append(f"- статус: притушен до {idle_snooze}")
-    elif mission is not None and mission.phase == "waiting_user":
+    elif active_phase is not None and active_phase.phase == "waiting_user":
         lines.append("- статус: ждёт ответа владельца")
+    elif mission is not None and mission.status == "blocked_user":
+        lines.append("- статус: миссия ждёт ответа владельца")
     elif counts["waiting_user"] > 0:
         lines.append("- статус: ждёт ответа владельца")
     elif counts["running"] > 0:
         lines.append("- статус: сейчас выполняет автономный шаг")
     elif counts["pending"] > 0:
         lines.append("- статус: есть запланированное продолжение")
+    elif mission is not None and mission.status == "completed":
+        lines.append("- статус: последняя миссия уже закрыта")
     else:
         lines.append("- статус: явного автономного хвоста сейчас нет")
+    if active_phase is not None and active_phase.phase == "scheduled":
+        lines.append("- причина следующего wake-up: запланированное продолжение текущей линии")
+    elif mission is not None and mission.status == "blocked_user":
+        lines.append("- причина следующего wake-up: ожидание ответа владельца")
+    elif counts["running"] > 0:
+        lines.append("- причина следующего wake-up: текущий этап ещё выполняется")
+    elif counts["pending"] > 0:
+        lines.append("- причина следующего wake-up: переход к следующему этапу или checkpoint")
+    elif not stopped:
+        lines.append("- причина следующего wake-up: обычный idle heartbeat")
     return "\n".join(lines)
 def _build_pulse_keyboard(*, stopped: bool = False) -> InlineKeyboardMarkup:
     rows = [

@@ -23,6 +23,7 @@ def _parse_dt(value: str) -> datetime | None:
 class AutonomyTask:
     id: int
     chat_id: int
+    mission_id: int | None
     kind: str
     title: str
     details: str
@@ -38,6 +39,27 @@ class AutonomyTask:
     result_text: str
     error_text: str
     continuation_count: int = 0
+
+
+@dataclass
+class AutonomyMission:
+    id: int
+    chat_id: int
+    source: str
+    root_objective: str
+    success_criteria: str
+    plan_state: str
+    plan_json: list[dict[str, object]]
+    current_stage_index: int
+    status: str
+    started_at: str
+    updated_at: str
+    completed_at: str | None
+    blocked_reason: str
+    current_focus: str
+    plan_updated_at: str | None
+    last_checkpoint_summary: str
+    last_self_check_summary: str
 
 
 @dataclass(frozen=True)
@@ -69,6 +91,7 @@ class AutonomyStore:
                 CREATE TABLE IF NOT EXISTS autonomy_tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL DEFAULT 0,
+                    mission_id INTEGER,
                     kind TEXT NOT NULL,
                     title TEXT NOT NULL,
                     details TEXT NOT NULL,
@@ -95,6 +118,10 @@ class AutonomyStore:
                 self._conn.execute(
                     "ALTER TABLE autonomy_tasks ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0"
                 )
+            if "mission_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_tasks ADD COLUMN mission_id INTEGER"
+                )
             if "parent_task_id" not in columns:
                 self._conn.execute(
                     "ALTER TABLE autonomy_tasks ADD COLUMN parent_task_id INTEGER"
@@ -115,6 +142,71 @@ class AutonomyStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autonomy_missions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL,
+                    root_objective TEXT NOT NULL,
+                    success_criteria TEXT NOT NULL,
+                    plan_state TEXT NOT NULL DEFAULT 'single_pass',
+                    plan_json TEXT NOT NULL DEFAULT '[]',
+                    current_stage_index INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    blocked_reason TEXT NOT NULL DEFAULT '',
+                    current_focus TEXT NOT NULL DEFAULT '',
+                    plan_updated_at TEXT,
+                    last_checkpoint_summary TEXT NOT NULL DEFAULT '',
+                    last_self_check_summary TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            mission_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(autonomy_missions)").fetchall()
+            }
+            if "plan_state" not in mission_columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_missions ADD COLUMN plan_state TEXT NOT NULL DEFAULT 'single_pass'"
+                )
+            if "plan_json" not in mission_columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_missions ADD COLUMN plan_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "current_stage_index" not in mission_columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_missions ADD COLUMN current_stage_index INTEGER NOT NULL DEFAULT 0"
+                )
+            if "plan_updated_at" not in mission_columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_missions ADD COLUMN plan_updated_at TEXT"
+                )
+            if "last_checkpoint_summary" not in mission_columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_missions ADD COLUMN last_checkpoint_summary TEXT NOT NULL DEFAULT ''"
+                )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_autonomy_missions_chat_status
+                ON autonomy_missions(chat_id, status, updated_at DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_autonomy_tasks_chat_status
+                ON autonomy_tasks(chat_id, status, scheduled_for, priority, id)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_autonomy_tasks_mission
+                ON autonomy_tasks(mission_id, id DESC)
+                """
+            )
 
     def enqueue_task(
         self,
@@ -122,6 +214,7 @@ class AutonomyStore:
         details: str = "",
         *,
         chat_id: int = 0,
+        mission_id: int | None = None,
         kind: str = "general",
         priority: int = 100,
         scheduled_for: str | None = None,
@@ -134,6 +227,7 @@ class AutonomyStore:
                 """
                 INSERT INTO autonomy_tasks (
                     chat_id,
+                    mission_id,
                     kind,
                     title,
                     details,
@@ -143,10 +237,11 @@ class AutonomyStore:
                     source,
                     created_at,
                     scheduled_for
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
+                    mission_id,
                     kind,
                     title,
                     details,
@@ -302,6 +397,7 @@ class AutonomyStore:
         self,
         task_id: int,
         *,
+        mission_id: int | None = None,
         title: str,
         details: str,
         kind: str,
@@ -317,6 +413,7 @@ class AutonomyStore:
                     details = ?,
                     kind = ?,
                     priority = ?,
+                    mission_id = COALESCE(?, mission_id),
                     status = 'pending',
                     scheduled_for = ?,
                     started_at = NULL,
@@ -332,11 +429,261 @@ class AutonomyStore:
                     details,
                     kind,
                     priority,
+                    mission_id,
                     scheduled_for,
                     progress_text,
                     task_id,
                 ),
             )
+
+    def set_task_mission(self, task_id: int, mission_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE autonomy_tasks
+                SET mission_id = ?
+                WHERE id = ?
+                """,
+                (mission_id, task_id),
+            )
+
+    def create_mission(
+        self,
+        *,
+        chat_id: int,
+        source: str,
+        root_objective: str,
+        success_criteria: str,
+        plan_state: str = "single_pass",
+        plan_json: list[dict[str, object]] | None = None,
+        current_stage_index: int = 0,
+        current_focus: str = "",
+        status: str = "active",
+        plan_updated_at: str | None = None,
+        last_checkpoint_summary: str = "",
+        last_self_check_summary: str = "",
+    ) -> int:
+        now = _utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO autonomy_missions (
+                    chat_id,
+                    source,
+                    root_objective,
+                    success_criteria,
+                    plan_state,
+                    plan_json,
+                    current_stage_index,
+                    status,
+                    started_at,
+                    updated_at,
+                    current_focus,
+                    plan_updated_at,
+                    last_checkpoint_summary,
+                    last_self_check_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    source.strip() or "initiative",
+                    root_objective.strip(),
+                    success_criteria.strip(),
+                    (plan_state.strip() or "single_pass"),
+                    json.dumps(plan_json or [], ensure_ascii=False),
+                    max(0, int(current_stage_index)),
+                    status.strip() or "active",
+                    now,
+                    now,
+                    current_focus.strip(),
+                    plan_updated_at,
+                    last_checkpoint_summary.strip(),
+                    last_self_check_summary.strip(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_mission(self, mission_id: int) -> AutonomyMission | None:
+        row = self._conn.execute(
+            """
+            SELECT *
+            FROM autonomy_missions
+            WHERE id = ?
+            """,
+            (mission_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_mission(row)
+
+    def get_live_mission(
+        self,
+        chat_id: int,
+        *,
+        source: str | None = None,
+    ) -> AutonomyMission | None:
+        params: list[object] = [chat_id]
+        source_sql = ""
+        if source:
+            source_sql = "AND source = ?"
+            params.append(source)
+        row = self._conn.execute(
+            f"""
+            SELECT *
+            FROM autonomy_missions
+            WHERE chat_id = ?
+              AND status IN ('active', 'blocked_user')
+              {source_sql}
+            ORDER BY
+              CASE status WHEN 'active' THEN 0 ELSE 1 END,
+              updated_at DESC,
+              id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_mission(row)
+
+    def update_mission(
+        self,
+        mission_id: int,
+        *,
+        status: str | None = None,
+        blocked_reason: str | None = None,
+        current_focus: str | None = None,
+        plan_state: str | None = None,
+        plan_json: list[dict[str, object]] | None = None,
+        current_stage_index: int | None = None,
+        plan_updated_at: str | None = None,
+        last_checkpoint_summary: str | None = None,
+        last_self_check_summary: str | None = None,
+        root_objective: str | None = None,
+        success_criteria: str | None = None,
+    ) -> None:
+        assignments = ["updated_at = ?"]
+        params: list[object] = [_utc_now()]
+        if status is not None:
+            assignments.append("status = ?")
+            params.append(status)
+            if status == "completed":
+                assignments.append("completed_at = ?")
+                params.append(_utc_now())
+            elif status in {"active", "blocked_user", "abandoned"}:
+                assignments.append("completed_at = NULL")
+        if blocked_reason is not None:
+            assignments.append("blocked_reason = ?")
+            params.append(blocked_reason)
+        if current_focus is not None:
+            assignments.append("current_focus = ?")
+            params.append(current_focus)
+        if plan_state is not None:
+            assignments.append("plan_state = ?")
+            params.append(plan_state)
+        if plan_json is not None:
+            assignments.append("plan_json = ?")
+            params.append(json.dumps(plan_json, ensure_ascii=False))
+        if current_stage_index is not None:
+            assignments.append("current_stage_index = ?")
+            params.append(max(0, int(current_stage_index)))
+        if plan_updated_at is not None:
+            assignments.append("plan_updated_at = ?")
+            params.append(plan_updated_at)
+        if last_checkpoint_summary is not None:
+            assignments.append("last_checkpoint_summary = ?")
+            params.append(last_checkpoint_summary)
+        if last_self_check_summary is not None:
+            assignments.append("last_self_check_summary = ?")
+            params.append(last_self_check_summary)
+        if root_objective is not None:
+            assignments.append("root_objective = ?")
+            params.append(root_objective)
+        if success_criteria is not None:
+            assignments.append("success_criteria = ?")
+            params.append(success_criteria)
+        params.append(mission_id)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"""
+                UPDATE autonomy_missions
+                SET {", ".join(assignments)}
+                WHERE id = ?
+                """,
+                params,
+            )
+
+    def complete_mission(
+        self,
+        mission_id: int,
+        *,
+        current_focus: str = "",
+        last_self_check_summary: str = "",
+    ) -> None:
+        self.update_mission(
+            mission_id,
+            status="completed",
+            blocked_reason="",
+            current_focus=current_focus,
+            plan_state="single_pass",
+            plan_json=[],
+            current_stage_index=0,
+            plan_updated_at="",
+            last_checkpoint_summary="",
+            last_self_check_summary=last_self_check_summary,
+        )
+
+    def block_mission(
+        self,
+        mission_id: int,
+        *,
+        reason: str,
+        current_focus: str = "",
+        last_checkpoint_summary: str = "",
+        last_self_check_summary: str = "",
+    ) -> None:
+        self.update_mission(
+            mission_id,
+            status="blocked_user",
+            blocked_reason=reason,
+            current_focus=current_focus,
+            last_checkpoint_summary=last_checkpoint_summary,
+            last_self_check_summary=last_self_check_summary,
+        )
+
+    def abandon_mission(
+        self,
+        mission_id: int,
+        *,
+        reason: str = "",
+        current_focus: str = "",
+        last_self_check_summary: str = "",
+    ) -> None:
+        self.update_mission(
+            mission_id,
+            status="abandoned",
+            blocked_reason=reason,
+            current_focus=current_focus,
+            last_self_check_summary=last_self_check_summary,
+        )
+
+    def list_mission_tasks(
+        self,
+        mission_id: int,
+        *,
+        limit: int = 10,
+    ) -> list[AutonomyTask]:
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM autonomy_tasks
+            WHERE mission_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (mission_id, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_task(row) for row in rows]
 
     def resume_waiting_tasks(self, chat_id: int, *, user_signal: int, now: str | None = None) -> int:
         effective_now = now or _utc_now()
@@ -695,6 +1042,7 @@ class AutonomyStore:
         return AutonomyTask(
             id=int(row["id"]),
             chat_id=int(row["chat_id"]),
+            mission_id=int(row["mission_id"]) if row["mission_id"] is not None else None,
             kind=str(row["kind"]),
             title=str(row["title"]),
             details=str(row["details"]),
@@ -712,6 +1060,28 @@ class AutonomyStore:
             result_text=str(row["result_text"] or ""),
             error_text=str(row["error_text"] or ""),
             continuation_count=int(row["continuation_count"] or 0),
+        )
+
+    @staticmethod
+    def _row_to_mission(row: sqlite3.Row | dict[str, object]) -> AutonomyMission:
+        return AutonomyMission(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            source=str(row["source"]),
+            root_objective=str(row["root_objective"] or ""),
+            success_criteria=str(row["success_criteria"] or ""),
+            plan_state=str(row["plan_state"] or "single_pass"),
+            plan_json=json.loads(str(row["plan_json"] or "[]")),
+            current_stage_index=int(row["current_stage_index"] or 0),
+            status=str(row["status"] or "active"),
+            started_at=str(row["started_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+            completed_at=str(row["completed_at"]) if row["completed_at"] else None,
+            blocked_reason=str(row["blocked_reason"] or ""),
+            current_focus=str(row["current_focus"] or ""),
+            plan_updated_at=str(row["plan_updated_at"]) if row["plan_updated_at"] else None,
+            last_checkpoint_summary=str(row["last_checkpoint_summary"] or ""),
+            last_self_check_summary=str(row["last_self_check_summary"] or ""),
         )
 
     def close(self) -> None:

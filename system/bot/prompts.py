@@ -83,6 +83,76 @@ def _wakeup_context_block(
     return "\n".join(parts)
 
 
+def _mission_contract_block(
+    *,
+    mission_source: str = "",
+    mission_root_objective: str = "",
+    mission_success_criteria: str = "",
+    mission_plan_state: str = "",
+    mission_current_stage: str = "",
+    mission_current_stage_goal: str = "",
+    mission_current_stage_done_when: str = "",
+    mission_next_stage: str = "",
+    mission_current_focus: str = "",
+    mission_last_checkpoint: str = "",
+    mission_last_self_check: str = "",
+    mission_recent_checkpoints: list[str] | None = None,
+    mission_recent_lines: list[str] | None = None,
+) -> str:
+    if not any(
+        [
+            mission_source.strip(),
+            mission_root_objective.strip(),
+            mission_success_criteria.strip(),
+            mission_plan_state.strip(),
+            mission_current_stage.strip(),
+            mission_current_stage_goal.strip(),
+            mission_current_stage_done_when.strip(),
+            mission_next_stage.strip(),
+            mission_current_focus.strip(),
+            mission_last_checkpoint.strip(),
+            mission_last_self_check.strip(),
+            any((mission_recent_checkpoints or [])),
+            any((mission_recent_lines or [])),
+        ]
+    ):
+        return ""
+    parts = ["Миссионный контракт текущего автономного сеанса:"]
+    if mission_source.strip():
+        parts.append(f"- source: {mission_source.strip()}")
+    if mission_root_objective.strip():
+        parts.append(f"- root objective: {mission_root_objective.strip()}")
+    if mission_success_criteria.strip():
+        parts.append(f"- success criteria: {mission_success_criteria.strip()}")
+    if mission_plan_state.strip():
+        parts.append(f"- plan state: {mission_plan_state.strip()}")
+    if mission_current_stage.strip():
+        parts.append(f"- current stage: {mission_current_stage.strip()}")
+    if mission_current_stage_goal.strip():
+        parts.append(f"- current stage goal: {mission_current_stage_goal.strip()}")
+    if mission_current_stage_done_when.strip():
+        parts.append(f"- current stage done when: {mission_current_stage_done_when.strip()}")
+    if mission_next_stage.strip():
+        parts.append(f"- next stage: {mission_next_stage.strip()}")
+    if mission_current_focus.strip():
+        parts.append(f"- current focus: {mission_current_focus.strip()}")
+    if mission_last_checkpoint.strip():
+        parts.append(f"- last checkpoint: {mission_last_checkpoint.strip()}")
+    if mission_last_self_check.strip():
+        parts.append(f"- last self-check summary: {mission_last_self_check.strip()}")
+    recent_checkpoints = [
+        line.strip() for line in (mission_recent_checkpoints or []) if line.strip()
+    ]
+    if recent_checkpoints:
+        parts.append("Последние checkpoint'ы по этой же миссии:")
+        parts.extend(f"- {line}" for line in recent_checkpoints)
+    recent = [line.strip() for line in (mission_recent_lines or []) if line.strip()]
+    if recent:
+        parts.append("Последние шаги по этой же миссии:")
+        parts.extend(f"- {line}" for line in recent)
+    return "\n".join(parts)
+
+
 def _workspace_memory_note() -> str:
     memory_files = "\n".join(f"- `{path}`" for path in MEMORY_FILES)
     return (
@@ -140,6 +210,19 @@ def build_autonomy_wakeup_prompt(
     current_task_details: str = "",
     current_task_kind: str = "general",
     current_task_continuation_count: int = 0,
+    mission_source: str = "",
+    mission_root_objective: str = "",
+    mission_success_criteria: str = "",
+    mission_plan_state: str = "",
+    mission_current_stage: str = "",
+    mission_current_stage_goal: str = "",
+    mission_current_stage_done_when: str = "",
+    mission_next_stage: str = "",
+    mission_current_focus: str = "",
+    mission_last_checkpoint: str = "",
+    mission_last_self_check: str = "",
+    mission_recent_checkpoints: list[str] | None = None,
+    mission_recent_lines: list[str] | None = None,
     active_request_lines: list[str] | None = None,
     recent_task_lines: list[str] | None = None,
     recent_journal_lines: list[str] | None = None,
@@ -155,6 +238,21 @@ def build_autonomy_wakeup_prompt(
         recent_task_lines,
         recent_journal_lines,
         recent_user_lines,
+    )
+    mission_contract = _mission_contract_block(
+        mission_source=mission_source,
+        mission_root_objective=mission_root_objective,
+        mission_success_criteria=mission_success_criteria,
+        mission_plan_state=mission_plan_state,
+        mission_current_stage=mission_current_stage,
+        mission_current_stage_goal=mission_current_stage_goal,
+        mission_current_stage_done_when=mission_current_stage_done_when,
+        mission_next_stage=mission_next_stage,
+        mission_current_focus=mission_current_focus,
+        mission_last_checkpoint=mission_last_checkpoint,
+        mission_last_self_check=mission_last_self_check,
+        mission_recent_checkpoints=mission_recent_checkpoints,
+        mission_recent_lines=mission_recent_lines,
     )
     workspace_memory_note = _workspace_memory_note()
 
@@ -269,9 +367,120 @@ def build_autonomy_wakeup_prompt(
         "Если продолжение не нужно, не добавляй этот блок.\n"
         "Не ставь follow-up автоматически только ради того, чтобы не остановиться; он нужен только если реально есть следующий осмысленный шаг.\n"
         "Если владелец напишет, у него приоритет над автономностью.\n\n"
+        "Думай не про абстрактный `следующий шаг`, а про корневую миссию. "
+        "Каждый новый шаг должен либо заметно приблизить `success criteria`, либо честно закрыть миссию, "
+        "либо вывести её в явный внешний блокер.\n"
+        "Если миссия длинная, сначала реши, нужен ли stage-based план. "
+        "Для короткой задачи выбери `PLAN_MODE: single_pass`. "
+        "Для длинной задачи выбери `PLAN_MODE: staged`, составь компактный план из 3-6 этапов и дальше работай по текущему этапу, а не по микрошагу.\n"
+        "Этапы должны быть среднего масштаба и давать заметный артефакт. "
+        "Этап не должен называться в духе `подумать ещё раз`, `сделать маленький хвост` или `вернуться позже без причины`.\n"
+        "Если хочешь отложить продолжение, ты обязан доказать, что остаток нельзя или не стоит закрывать сейчас, "
+        "и почему это именно отдельный wake-up, а не продолжение текущего сеанса.\n"
+        "После `RESULT` обязательно добавь строки:\n"
+        "PLAN_MODE: single_pass | staged\n"
+        "ROOT_OBJECTIVE: корневая цель миссии; если уже дана и не меняется, повтори её кратко\n"
+        "SUCCESS_CRITERIA: как понять, что миссия реально завершена\n"
+        "CURRENT_STAGE: текущий этап или `single_pass`\n"
+        "NEXT_STAGE: следующий этап или `none`\n"
+        "MISSION_STATUS: continue_now | follow_up_later | complete | blocked_user\n"
+        "STAGE_STATUS: continue_stage | stage_done | blocked_user | complete_mission\n"
+        "CHECKPOINT_SUMMARY: что именно стало готовым в этом проходе\n"
+        "WHY_NOT_DONE_NOW: почему остаток не закрыт сейчас; если всё завершено, так и напиши\n"
+        "BLOCKER_TYPE: none | user | external | timebox | context_missing\n"
+        "GOAL_CHECK: как текущий шаг связан с root objective\n"
+        "PROGRESS_DELTA: какой реальный прогресс получен в этом шаге\n"
+        "DRIFT_RISK: есть ли риск, что ты ушёл в сторону или дробишь работу зря\n"
+        "WHY_NOT_FINISHED_NOW: почему миссия ещё не завершена сейчас; если завершена — напиши `completed now`\n"
+        "NEXT_STEP_JUSTIFICATION: зачем вообще нужен следующий шаг; если он не нужен — напиши `no follow-up needed`\n\n"
+        "Если выбираешь `PLAN_MODE: staged` и это первый проход миссии или ты перепланировал этапы, "
+        "добавь в КОНЕЦ ответа служебный блок:\n"
+        "[[mission-plan]]\n"
+        "### Название этапа 1\n"
+        "goal: что должен дать этап\n"
+        "done_when: как понять, что этап закрыт\n"
+        "status: active | pending | done | blocked\n"
+        "completion_summary: кратко или пусто\n"
+        "### Название этапа 2\n"
+        "...\n"
+        "[[/mission-plan]]\n"
+        "Разрешено тихо перепланировать этапы, если root objective и success criteria по смыслу не меняются.\n\n"
+        f"{mission_contract}\n\n"
         f"{current_task_block}"
         f"{wakeup_context}\n\n"
         f"{memory_note}\n\n"
         f"{send_files_note}\n\n"
         f"{risky_note}"
+    )
+
+
+def build_autonomy_control_prompt(
+    *,
+    mission_source: str,
+    mission_root_objective: str,
+    mission_success_criteria: str,
+    mission_plan_state: str = "",
+    mission_current_stage: str = "",
+    mission_current_stage_done_when: str = "",
+    mission_next_stage: str = "",
+    mission_current_focus: str,
+    mission_last_checkpoint: str = "",
+    mission_recent_lines: list[str] | None,
+    step_title: str,
+    step_result: str,
+    proposed_mission_status: str,
+    proposed_stage_status: str = "",
+    proposed_next_title: str = "",
+    proposed_next_details: str = "",
+    proposed_delay_sec: int | None = None,
+    why_not_done_now: str = "",
+    blocker_type: str = "none",
+    next_step_justification: str = "",
+) -> str:
+    recent_lines = [line.strip() for line in (mission_recent_lines or []) if line.strip()]
+    recent_block = "\n".join(f"- {line}" for line in recent_lines) or "- (нет недавних шагов)"
+    next_block = "- next step: (none proposed)"
+    if proposed_next_title.strip() or proposed_next_details.strip() or proposed_delay_sec is not None:
+        delay_line = f", delay={proposed_delay_sec}s" if proposed_delay_sec is not None else ""
+        next_block = (
+            f"- next step: {proposed_next_title.strip() or '(same mission)'}{delay_line}\n"
+            f"- next details: {proposed_next_details.strip() or '(none)'}"
+        )
+    return (
+        "Это короткий контрольный проход автономности. Не выполняй новую работу и не придумывай новую цель.\n"
+        "Твоя задача — оценить, оправдан ли предложенный следующий шаг, или миссию лучше дожать сейчас / завершить / честно перевести в blocked_user.\n"
+        "Считай следующий шаг невалидным, если он не приближает success criteria, слишком мал, "
+        "мог быть включён в текущий проход или просто переименовывает тот же самый хвост.\n"
+        "Дополнительно проверь целостность этапа: соответствует ли шаг текущему этапу, "
+        "не пытается ли агент скрыть локальный хвост в отдельный wake-up и не пора ли закрыть этап целиком.\n"
+        "Предпочитай `APPROVE_CONTINUE_NOW`, если локальную работу ещё можно дожать в этом же wake-сеансе.\n"
+        "Предпочитай `APPROVE_FOLLOWUP` только если есть реальная причина вернуться позже.\n"
+        "Предпочитай `FORCE_STAGE_DONE`, если этап фактически закрыт, а модель просит ещё мелкий хвост.\n"
+        "Предпочитай `FORCE_COMPLETE`, если миссия фактически уже закрыта.\n"
+        "Предпочитай `FORCE_BLOCKED_USER`, если дальше реально нужен владелец.\n"
+        "Если видно микродробление, верни `REJECT_AS_MICROSTEP`.\n\n"
+        "Ответь строго так:\n"
+        "VERDICT: APPROVE_CONTINUE_NOW | APPROVE_FOLLOWUP | FORCE_STAGE_DONE | FORCE_COMPLETE | FORCE_BLOCKED_USER | REJECT_AS_MICROSTEP\n"
+        "REASON: одна короткая причина\n\n"
+        "Mission:\n"
+        f"- source: {mission_source}\n"
+        f"- root objective: {mission_root_objective or '(not set)'}\n"
+        f"- success criteria: {mission_success_criteria or '(not set)'}\n"
+        f"- plan state: {mission_plan_state or '(not set)'}\n"
+        f"- current stage: {mission_current_stage or '(not set)'}\n"
+        f"- current stage done when: {mission_current_stage_done_when or '(not set)'}\n"
+        f"- next stage: {mission_next_stage or '(not set)'}\n"
+        f"- current focus: {mission_current_focus or '(not set)'}\n"
+        f"- last checkpoint: {mission_last_checkpoint or '(not set)'}\n"
+        "Recent mission history:\n"
+        f"{recent_block}\n\n"
+        "Current step:\n"
+        f"- title: {step_title or '(untitled)'}\n"
+        f"- proposed mission status: {proposed_mission_status or '(not set)'}\n"
+        f"- proposed stage status: {proposed_stage_status or '(not set)'}\n"
+        f"- blocker type: {blocker_type or 'none'}\n"
+        f"- why not done now: {why_not_done_now or '(not provided)'}\n"
+        f"- result: {step_result or '(empty)'}\n"
+        f"- next-step justification: {next_step_justification or '(not provided)'}\n"
+        f"{next_block}\n"
     )

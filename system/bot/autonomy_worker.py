@@ -14,13 +14,20 @@ from .autonomy_journal import (
     append_autonomy_journal_entry,
     read_recent_autonomy_journal_entries,
 )
-from .autonomy_planner import extract_autonomy_continuation, extract_self_review, parse_wakeup_decision
+from .autonomy_planner import (
+    AutonomyContinuation,
+    extract_autonomy_continuation,
+    extract_mission_plan,
+    extract_self_review,
+    parse_control_decision,
+    parse_wakeup_decision,
+)
 from .autonomy_requests import read_active_autonomy_request_summaries
-from .autonomy_store import AutonomyStore, AutonomyTask
+from .autonomy_store import AutonomyMission, AutonomyStore, AutonomyTask
 from .codex_runner import CodexRunner
 from .config import Settings
 from .delivery import deliver_agent_response, parse_agent_response
-from .prompts import build_autonomy_wakeup_prompt
+from .prompts import build_autonomy_control_prompt, build_autonomy_wakeup_prompt
 from .queue_store import QueueStore
 
 
@@ -105,6 +112,19 @@ class AutonomyWorker:
                 details = (task.details or task.result_text or task.error_text or "").strip()
             else:
                 details = (task.result_text or task.error_text or task.details or "").strip()
+            summary = f"#{task.id} [{task.status}] {title}"
+            if details:
+                compact = " ".join(details.split())
+                summary = f"{summary} — {compact[:140]}".rstrip()
+            lines.append(summary)
+        return lines
+
+    def _recent_mission_lines(self, mission_id: int, *, limit: int = 3) -> list[str]:
+        tasks = self._autonomy_store.list_mission_tasks(mission_id, limit=limit)
+        lines: list[str] = []
+        for task in tasks:
+            title = task.title.strip() or "(без названия)"
+            details = (task.result_text or task.error_text or task.details or "").strip()
             summary = f"#{task.id} [{task.status}] {title}"
             if details:
                 compact = " ".join(details.split())
@@ -327,6 +347,387 @@ class AutonomyWorker:
     def _scheduled_after(delay_sec: int) -> str:
         return (datetime.now(timezone.utc) + timedelta(seconds=delay_sec)).isoformat()
 
+    @staticmethod
+    def _default_success_criteria(source: str) -> str:
+        if source == "owner_request":
+            return (
+                "Довести явное поручение владельца до заметного результата, завершения "
+                "или честного внешнего блокера без микродробления."
+            )
+        return (
+            "Сделать заметный полезный checkpoint по выбранной линии и не плодить "
+            "мелкие follow-up без необходимости."
+        )
+
+    @classmethod
+    def _owner_root_objective(cls, active_request_lines: list[str]) -> str:
+        lines = [line.strip() for line in active_request_lines if line.strip()]
+        if not lines:
+            return "Обработать текущее поручение владельца"
+        if len(lines) == 1:
+            return lines[0]
+        return f"{lines[0]} (+ ещё {len(lines) - 1} активн. поруч.)"
+
+    @staticmethod
+    def _build_self_check_summary(decision: object) -> str:
+        parts: list[str] = []
+        for label, value in (
+            ("goal", getattr(decision, "goal_check", "")),
+            ("progress", getattr(decision, "progress_delta", "")),
+            ("drift", getattr(decision, "drift_risk", "")),
+            ("why_not_done_now", getattr(decision, "why_not_done_now", "")),
+            ("next_step", getattr(decision, "next_step_justification", "")),
+        ):
+            clean = " ".join((value or "").split()).strip()
+            if clean:
+                parts.append(f"{label}: {clean}")
+        return " | ".join(parts)[:600]
+
+    @staticmethod
+    def _normalize_plan_state(value: str) -> str:
+        return value if value in {"single_pass", "staged"} else "single_pass"
+
+    @staticmethod
+    def _normalize_stage_status(value: str) -> str:
+        return value if value in {"pending", "active", "done", "blocked"} else "pending"
+
+    @classmethod
+    def _normalize_plan_json(
+        cls,
+        plan_json: list[dict[str, object]] | None,
+    ) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        for raw_stage in (plan_json or [])[:6]:
+            title = str(raw_stage.get("title", "")).strip()
+            if not title:
+                continue
+            status = cls._normalize_stage_status(str(raw_stage.get("status", "pending")).strip())
+            normalized.append(
+                {
+                    "title": title,
+                    "goal": str(raw_stage.get("goal", "")).strip(),
+                    "done_when": str(raw_stage.get("done_when", "")).strip(),
+                    "status": status,
+                    "completion_summary": str(raw_stage.get("completion_summary", "")).strip(),
+                }
+            )
+        if not normalized:
+            return []
+        if not any(stage["status"] == "active" for stage in normalized):
+            first_pending = next(
+                (index for index, stage in enumerate(normalized) if stage["status"] == "pending"),
+                0,
+            )
+            normalized[first_pending]["status"] = "active"
+        return normalized
+
+    @classmethod
+    def _plan_stage_at(
+        cls,
+        mission: AutonomyMission,
+        index: int | None = None,
+    ) -> dict[str, str] | None:
+        stages = cls._normalize_plan_json(mission.plan_json)
+        if not stages:
+            return None
+        stage_index = mission.current_stage_index if index is None else index
+        if stage_index < 0 or stage_index >= len(stages):
+            return None
+        return stages[stage_index]
+
+    @classmethod
+    def _current_stage(cls, mission: AutonomyMission) -> dict[str, str] | None:
+        return cls._plan_stage_at(mission)
+
+    @classmethod
+    def _next_stage(cls, mission: AutonomyMission) -> dict[str, str] | None:
+        return cls._plan_stage_at(mission, mission.current_stage_index + 1)
+
+    @classmethod
+    def _recent_checkpoint_lines(cls, mission: AutonomyMission) -> list[str]:
+        lines: list[str] = []
+        if mission.last_checkpoint_summary.strip():
+            lines.append(mission.last_checkpoint_summary.strip())
+        for stage in cls._normalize_plan_json(mission.plan_json):
+            summary = stage.get("completion_summary", "").strip()
+            if summary:
+                lines.append(f"{stage.get('title', '').strip()}: {summary}")
+        return lines[-3:]
+
+    @classmethod
+    def _plan_from_extracted(
+        cls,
+        mission_plan: object | None,
+    ) -> list[dict[str, str]]:
+        stages = getattr(mission_plan, "stages", None) or []
+        plan_json = [
+            {
+                "title": getattr(stage, "title", "").strip(),
+                "goal": getattr(stage, "goal", "").strip(),
+                "done_when": getattr(stage, "done_when", "").strip(),
+                "status": cls._normalize_stage_status(getattr(stage, "status", "").strip()),
+                "completion_summary": getattr(stage, "completion_summary", "").strip(),
+            }
+            for stage in stages
+            if getattr(stage, "title", "").strip()
+        ]
+        return cls._normalize_plan_json(plan_json)
+
+    @staticmethod
+    def _stable_plan_identity(mission: AutonomyMission, decision: object) -> bool:
+        declared_root = getattr(decision, "root_objective", "").strip()
+        declared_success = getattr(decision, "success_criteria", "").strip()
+        root_ok = not declared_root or declared_root == mission.root_objective
+        success_ok = not declared_success or declared_success == mission.success_criteria
+        return root_ok and success_ok
+
+    def _sync_mission_plan(
+        self,
+        mission: AutonomyMission,
+        *,
+        decision: object,
+        extracted_plan: object | None,
+        current_focus: str,
+    ) -> AutonomyMission:
+        plan_mode = getattr(decision, "plan_mode", "").strip().lower()
+        root_objective = getattr(decision, "root_objective", "").strip() or mission.root_objective
+        success_criteria = getattr(decision, "success_criteria", "").strip() or mission.success_criteria
+        changed = False
+        update_kwargs: dict[str, object] = {}
+
+        if root_objective != mission.root_objective:
+            update_kwargs["root_objective"] = root_objective
+            changed = True
+        if success_criteria != mission.success_criteria:
+            update_kwargs["success_criteria"] = success_criteria
+            changed = True
+
+        if plan_mode == "single_pass":
+            if mission.plan_state != "single_pass" or mission.plan_json:
+                update_kwargs.update(
+                    {
+                        "plan_state": "single_pass",
+                        "plan_json": [],
+                        "current_stage_index": 0,
+                        "plan_updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                changed = True
+        elif plan_mode == "staged":
+            new_plan_json = self._plan_from_extracted(extracted_plan)
+            if new_plan_json:
+                if mission.plan_state != "staged" or not mission.plan_json:
+                    update_kwargs.update(
+                        {
+                            "plan_state": "staged",
+                            "plan_json": new_plan_json,
+                            "current_stage_index": 0,
+                            "plan_updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    changed = True
+                elif self._stable_plan_identity(mission, decision):
+                    current_stage_title = (self._current_stage(mission) or {}).get("title", "")
+                    next_index = 0
+                    if current_stage_title:
+                        matched_index = next(
+                            (
+                                idx
+                                for idx, stage in enumerate(new_plan_json)
+                                if stage["title"] == current_stage_title
+                            ),
+                            None,
+                        )
+                        if matched_index is not None:
+                            next_index = matched_index
+                    if new_plan_json != self._normalize_plan_json(mission.plan_json) or next_index != mission.current_stage_index:
+                        update_kwargs.update(
+                            {
+                                "plan_state": "staged",
+                                "plan_json": new_plan_json,
+                                "current_stage_index": next_index,
+                                "plan_updated_at": datetime.now(timezone.utc).isoformat(),
+                                "last_checkpoint_summary": (
+                                    f"План тихо обновлён. Новый текущий этап: "
+                                    f"{new_plan_json[next_index]['title'] if new_plan_json else current_focus}"
+                                )[:600],
+                            }
+                        )
+                        changed = True
+
+        if changed:
+            self._autonomy_store.update_mission(mission.id, current_focus=current_focus, **update_kwargs)
+            refreshed = self._autonomy_store.get_mission(mission.id)
+            if refreshed is not None:
+                return refreshed
+        return mission
+
+    def _advance_stage(
+        self,
+        mission: AutonomyMission,
+        *,
+        completion_summary: str,
+        blocked: bool = False,
+    ) -> AutonomyMission:
+        plan_json = self._normalize_plan_json(mission.plan_json)
+        if not plan_json:
+            return mission
+        index = max(0, min(mission.current_stage_index, len(plan_json) - 1))
+        plan_json[index]["status"] = "blocked" if blocked else "done"
+        plan_json[index]["completion_summary"] = completion_summary.strip()[:600]
+
+        next_index = index
+        if not blocked:
+            next_index = min(index + 1, len(plan_json))
+            if next_index < len(plan_json):
+                for stage_index, stage in enumerate(plan_json):
+                    if stage_index == next_index and stage["status"] != "done":
+                        stage["status"] = "active"
+                    elif stage_index > index and stage["status"] == "active":
+                        stage["status"] = "pending"
+
+        self._autonomy_store.update_mission(
+            mission.id,
+            plan_json=plan_json,
+            current_stage_index=next_index,
+            plan_updated_at=datetime.now(timezone.utc).isoformat(),
+            last_checkpoint_summary=completion_summary.strip()[:600],
+            current_focus=(
+                plan_json[next_index]["title"]
+                if not blocked and next_index < len(plan_json)
+                else mission.current_focus
+            ),
+        )
+        refreshed = self._autonomy_store.get_mission(mission.id)
+        return refreshed or mission
+
+    @staticmethod
+    def _infer_stage_status(decision: object, proposed_mission_status: str, staged: bool) -> str:
+        explicit = getattr(decision, "stage_status", "").strip().lower()
+        if explicit in {"continue_stage", "stage_done", "blocked_user", "complete_mission"}:
+            return explicit
+        if proposed_mission_status == "blocked_user":
+            return "blocked_user"
+        if proposed_mission_status == "complete":
+            return "complete_mission"
+        if staged:
+            return "continue_stage"
+        return ""
+
+    def _ensure_mission(
+        self,
+        *,
+        chat_id: int,
+        task: AutonomyTask | None,
+        active_request_lines: list[str],
+    ) -> AutonomyMission:
+        mission: AutonomyMission | None = None
+        if task is not None and task.mission_id is not None:
+            mission = self._autonomy_store.get_mission(task.mission_id)
+        if mission is not None:
+            return mission
+
+        if active_request_lines:
+            mission = self._autonomy_store.get_live_mission(chat_id, source="owner_request")
+            if mission is None:
+                root_objective = self._owner_root_objective(active_request_lines)
+                mission_id = self._autonomy_store.create_mission(
+                    chat_id=chat_id,
+                    source="owner_request",
+                    root_objective=root_objective,
+                    success_criteria=self._default_success_criteria("owner_request"),
+                    current_focus=(task.title if task is not None else root_objective),
+                )
+                mission = self._autonomy_store.get_mission(mission_id)
+            if mission is not None and task is not None and task.mission_id != mission.id:
+                self._autonomy_store.set_task_mission(task.id, mission.id)
+                task.mission_id = mission.id
+            if mission is not None:
+                return mission
+
+        mission = self._autonomy_store.get_live_mission(chat_id, source="initiative")
+        if mission is None:
+            root_objective = (
+                task.title.strip()
+                if task is not None and task.title.strip()
+                else "Сделать один полезный автономный шаг"
+            )
+            mission_id = self._autonomy_store.create_mission(
+                chat_id=chat_id,
+                source="initiative",
+                root_objective=root_objective,
+                success_criteria=self._default_success_criteria("initiative"),
+                current_focus=(task.title if task is not None else root_objective),
+            )
+            mission = self._autonomy_store.get_mission(mission_id)
+        if mission is not None and task is not None and task.mission_id != mission.id:
+            self._autonomy_store.set_task_mission(task.id, mission.id)
+            task.mission_id = mission.id
+        assert mission is not None
+        return mission
+
+    @staticmethod
+    def _infer_mission_status(
+        *,
+        decision_action: str,
+        declared_mission_status: str,
+        continuation_present: bool,
+        continuation_delay_sec: int,
+        blocks_on_user: bool,
+    ) -> str:
+        if declared_mission_status:
+            return declared_mission_status
+        if decision_action == "COMPLETE":
+            return "complete"
+        if blocks_on_user:
+            return "blocked_user"
+        if continuation_present:
+            return "continue_now" if continuation_delay_sec <= 0 else "follow_up_later"
+        return "complete"
+
+    async def _run_control_pass(
+        self,
+        *,
+        mission: AutonomyMission,
+        step_title: str,
+        step_result: str,
+        proposed_mission_status: str,
+        proposed_stage_status: str = "",
+        proposed_next_title: str = "",
+        proposed_next_details: str = "",
+        proposed_delay_sec: int | None = None,
+        why_not_done_now: str = "",
+        blocker_type: str = "none",
+        next_step_justification: str = "",
+        session_id: str = "",
+    ) -> tuple[str, str]:
+        prompt = build_autonomy_control_prompt(
+            mission_source=mission.source,
+            mission_root_objective=mission.root_objective,
+            mission_success_criteria=mission.success_criteria,
+            mission_plan_state=mission.plan_state,
+            mission_current_stage=(self._current_stage(mission) or {}).get("title", ""),
+            mission_current_stage_done_when=(self._current_stage(mission) or {}).get("done_when", ""),
+            mission_next_stage=(self._next_stage(mission) or {}).get("title", ""),
+            mission_current_focus=mission.current_focus,
+            mission_last_checkpoint=mission.last_checkpoint_summary,
+            mission_recent_lines=self._recent_mission_lines(mission.id),
+            step_title=step_title,
+            step_result=step_result,
+            proposed_mission_status=proposed_mission_status,
+            proposed_stage_status=proposed_stage_status,
+            proposed_next_title=proposed_next_title,
+            proposed_next_details=proposed_next_details,
+            proposed_delay_sec=proposed_delay_sec,
+            why_not_done_now=why_not_done_now,
+            blocker_type=blocker_type,
+            next_step_justification=next_step_justification,
+        )
+        result = await asyncio.to_thread(self._runner.run, prompt, session_id)
+        verdict = parse_control_decision(result.message or "")
+        next_session_id = result.session_id or session_id
+        return verdict.verdict, next_session_id
+
     def _schedule_mode(self, chat_id: int, mode: str, *, delay_sec: int | None = None, at: str | None = None) -> None:
         self._autonomy_store.set_mode(chat_id, mode)
         if at:
@@ -457,6 +858,18 @@ class AutonomyWorker:
             self._autonomy_store.set_last_seen_user_signal(chat_id, current_signal)
             active_request_lines = self._active_request_lines()
             task = self._autonomy_store.claim_next_ready_task(chat_id=chat_id)
+            owner_mission = self._autonomy_store.get_live_mission(chat_id, source="owner_request")
+            if (
+                task is not None
+                and owner_mission is not None
+                and task.mission_id != owner_mission.id
+            ):
+                self._autonomy_store.requeue_task(
+                    task.id,
+                    scheduled_for=task.scheduled_for,
+                    priority=task.priority,
+                )
+                task = None
             if task is None:
                 handled_idle = await self._maybe_handle_idle_state(
                     chat_id=chat_id,
@@ -588,25 +1001,52 @@ class AutonomyWorker:
         step_results: list[str] = []
         step_self_reviews: list[str] = []
         parsed_texts: list[str] = []
+        mission = self._ensure_mission(
+            chat_id=chat_id,
+            task=current_task,
+            active_request_lines=active_request_lines,
+        )
+        persisted_mission_id = mission.id
 
         self._autonomy_store.set_active_mission(
             chat_id,
             task_id=persisted_task_id,
-            title=current_title or "Автономный сеанс",
+            title=current_title or mission.current_focus or mission.root_objective or "Автономный сеанс",
             details=current_details,
             kind=current_kind,
             source=persisted_task_source,
             phase="running",
             scheduled_for=task.scheduled_for if task is not None else "",
         )
+        self._autonomy_store.update_mission(
+            persisted_mission_id,
+            status="active",
+            current_focus=current_title or mission.current_focus or mission.root_objective,
+        )
+        mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
 
         for step_index in range(self._settings.autonomy_session_step_limit):
+            current_stage = self._current_stage(mission)
+            next_stage = self._next_stage(mission)
             prompt = build_autonomy_wakeup_prompt(
                 current_task_id=persisted_task_id,
                 current_task_title=current_title,
                 current_task_details=current_details,
                 current_task_kind=current_kind,
                 current_task_continuation_count=current_task.continuation_count if current_task is not None else 0,
+                mission_source=mission.source,
+                mission_root_objective=mission.root_objective,
+                mission_success_criteria=mission.success_criteria,
+                mission_plan_state=mission.plan_state,
+                mission_current_stage=(current_stage or {}).get("title", ""),
+                mission_current_stage_goal=(current_stage or {}).get("goal", ""),
+                mission_current_stage_done_when=(current_stage or {}).get("done_when", ""),
+                mission_next_stage=(next_stage or {}).get("title", ""),
+                mission_current_focus=mission.current_focus or current_title,
+                mission_last_checkpoint=mission.last_checkpoint_summary,
+                mission_last_self_check=mission.last_self_check_summary,
+                mission_recent_checkpoints=self._recent_checkpoint_lines(mission),
+                mission_recent_lines=self._recent_mission_lines(persisted_mission_id),
                 active_request_lines=active_request_lines,
                 recent_task_lines=self._recent_task_lines(chat_id),
                 recent_journal_lines=self._recent_journal_lines(),
@@ -628,12 +1068,18 @@ class AutonomyWorker:
                 failure_text = (result.message or "").strip() + suffix
                 if persisted_task_id is not None:
                     self._autonomy_store.fail_task(persisted_task_id, failure_text)
-                    self._autonomy_store.clear_active_mission(chat_id)
-                    self._schedule_mode(
-                        chat_id,
-                        "cooldown",
-                        delay_sec=self._settings.autonomy_default_sleep_sec,
-                    )
+                self._autonomy_store.clear_active_mission(chat_id)
+                self._autonomy_store.abandon_mission(
+                    persisted_mission_id,
+                    reason=(result.message or "Автономная задача завершилась ошибкой.").strip(),
+                    current_focus=current_title or mission.current_focus,
+                )
+                self._schedule_mode(
+                    chat_id,
+                    "cooldown",
+                    delay_sec=self._settings.autonomy_default_sleep_sec,
+                )
+                if persisted_task_id is not None:
                     self._journal(
                         "failed",
                         current_title or "Автономный шаг",
@@ -646,6 +1092,7 @@ class AutonomyWorker:
                 return
 
             clean_message, continuation = extract_autonomy_continuation(result.message or "")
+            clean_message, mission_plan = extract_mission_plan(clean_message)
             clean_message, self_review = extract_self_review(clean_message)
             decision = parse_wakeup_decision(clean_message)
             if (
@@ -653,7 +1100,7 @@ class AutonomyWorker:
                 and clean_message.strip()
                 and clean_message.strip().upper() != "ACTION: NOOP"
             ):
-                fallback_title = current_title or "Автономный шаг"
+                fallback_title = current_title or mission.current_focus or "Автономный шаг"
                 fallback_kind = current_kind or "general"
                 fallback_details = current_details or ""
                 decision = parse_wakeup_decision(
@@ -673,6 +1120,11 @@ class AutonomyWorker:
 
             if decision.action == "COMPLETE":
                 if persisted_task_id is None:
+                    self._autonomy_store.complete_mission(
+                        persisted_mission_id,
+                        current_focus=current_title or mission.current_focus,
+                        last_self_check_summary=self._build_self_check_summary(decision),
+                    )
                     self._autonomy_store.clear_active_mission(chat_id)
                     self._schedule_mode(
                         chat_id,
@@ -692,6 +1144,11 @@ class AutonomyWorker:
                     self_reviews=step_self_reviews,
                 )
                 self._autonomy_store.complete_task(persisted_task_id, stored)
+                self._autonomy_store.complete_mission(
+                    persisted_mission_id,
+                    current_focus=current_title or mission.current_focus,
+                    last_self_check_summary=self._build_self_check_summary(decision),
+                )
                 self._autonomy_store.clear_active_mission(chat_id)
                 self._schedule_mode(
                     chat_id,
@@ -704,6 +1161,7 @@ class AutonomyWorker:
                     task=AutonomyTask(
                         id=persisted_task_id,
                         chat_id=chat_id,
+                        mission_id=persisted_mission_id,
                         kind=current_kind or "general",
                         title=current_title or "Автономный шаг",
                         details=current_details,
@@ -728,7 +1186,7 @@ class AutonomyWorker:
                     "closed_after_user_interrupt" if user_signal_changed else "closed"
                 )
                 summary = parsed.text or final_text
-                self._journal("completed", current_title or "Автономный шаг", summary, task_id=persisted_task_id)
+                self._journal("completed", current_title or mission.current_focus or "Автономный шаг", summary, task_id=persisted_task_id)
                 return
 
             if decision.action != "STEP":
@@ -737,12 +1195,17 @@ class AutonomyWorker:
                     self._autonomy_store.set_active_mission(
                         chat_id,
                         task_id=persisted_task_id,
-                        title=current_title or "Автономный сеанс",
+                        title=current_title or mission.current_focus or "Автономный сеанс",
                         details=current_details,
                         kind=current_kind,
                         source=persisted_task_source,
                         phase="scheduled" if current_task is not None and current_task.scheduled_for else "running",
                         scheduled_for=current_task.scheduled_for if current_task is not None else "",
+                    )
+                    self._autonomy_store.update_mission(
+                        persisted_mission_id,
+                        status="active",
+                        current_focus=current_title or mission.current_focus,
                     )
                 self._schedule_mode(
                     chat_id,
@@ -754,11 +1217,18 @@ class AutonomyWorker:
                 )
                 return
 
-            effective_title = decision.title.strip() or (current_title or "Автономный шаг")
+            effective_title = decision.title.strip() or (current_title or mission.current_focus or "Автономный шаг")
             effective_kind = decision.kind.strip() or (current_kind or "general")
             effective_details = decision.details.strip() or current_details
             effective_priority = decision.priority
             result_text = decision.result_text.strip() or clean_message.strip()
+            self_check_summary = self._build_self_check_summary(decision)
+            mission = self._sync_mission_plan(
+                mission,
+                decision=decision,
+                extracted_plan=mission_plan,
+                current_focus=effective_title,
+            )
             if self_review is not None:
                 step_self_reviews.append(
                     self._format_self_review_block(
@@ -768,13 +1238,34 @@ class AutonomyWorker:
                         self_review.check,
                     )
                 )
-            blocks_on_user = self._needs_user_response_pause(result_text)
+            blocks_on_user = self._needs_user_response_pause(result_text) or decision.blocker_type == "user"
+            proposed_mission_status = self._infer_mission_status(
+                decision_action=decision.action,
+                declared_mission_status=decision.mission_status,
+                continuation_present=continuation is not None,
+                continuation_delay_sec=continuation.delay_sec if continuation is not None else 0,
+                blocks_on_user=blocks_on_user,
+            )
+            staged_mission = mission.plan_state == "staged" and self._current_stage(mission) is not None
+            proposed_stage_status = self._infer_stage_status(
+                decision,
+                proposed_mission_status,
+                staged_mission,
+            )
+            checkpoint_summary = decision.checkpoint_summary.strip() or result_text
 
             if (
                 persisted_task_id is None
                 and blocks_on_user
                 and self._has_duplicate_waiting_blocker(chat_id, result_text)
             ):
+                self._autonomy_store.block_mission(
+                    persisted_mission_id,
+                    reason=result_text,
+                    current_focus=effective_title,
+                    last_checkpoint_summary=checkpoint_summary[:600],
+                    last_self_check_summary=self_check_summary,
+                )
                 self._schedule_mode(
                     chat_id,
                     "waiting_user",
@@ -786,6 +1277,7 @@ class AutonomyWorker:
             if persisted_task_id is None:
                 persisted_task_id = self._autonomy_store.enqueue_task(
                     chat_id=chat_id,
+                    mission_id=persisted_mission_id,
                     title=effective_title,
                     details=effective_details,
                     kind=effective_kind,
@@ -793,6 +1285,10 @@ class AutonomyWorker:
                     source="heartbeat",
                 )
                 persisted_task_source = "heartbeat"
+            elif current_task is not None and current_task.mission_id != persisted_mission_id:
+                self._autonomy_store.set_task_mission(persisted_task_id, persisted_mission_id)
+                current_task.mission_id = persisted_mission_id
+
             self._autonomy_store.set_active_mission(
                 chat_id,
                 task_id=persisted_task_id,
@@ -803,6 +1299,14 @@ class AutonomyWorker:
                 phase="running",
                 scheduled_for=current_task.scheduled_for if current_task is not None else "",
             )
+            self._autonomy_store.update_mission(
+                persisted_mission_id,
+                status="active",
+                current_focus=effective_title,
+                last_checkpoint_summary=checkpoint_summary[:600],
+                last_self_check_summary=self_check_summary,
+            )
+            mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
 
             current_title = effective_title
             current_kind = effective_kind
@@ -813,7 +1317,7 @@ class AutonomyWorker:
             if parsed.text:
                 parsed_texts.append(parsed.text)
 
-            if blocks_on_user:
+            if blocks_on_user or proposed_mission_status == "blocked_user":
                 final_text = "\n\n".join(step_results).strip()
                 self._autonomy_store.wait_for_user(
                     persisted_task_id,
@@ -839,11 +1343,19 @@ class AutonomyWorker:
                     phase="waiting_user",
                     scheduled_for="",
                 )
+                self._autonomy_store.block_mission(
+                    persisted_mission_id,
+                    reason=decision.why_not_done_now or result_text,
+                    current_focus=current_title,
+                    last_checkpoint_summary=checkpoint_summary[:600],
+                    last_self_check_summary=self_check_summary,
+                )
                 await self._maybe_notify_completion(
                     chat_id=chat_id,
                     task=AutonomyTask(
                         id=persisted_task_id,
                         chat_id=chat_id,
+                        mission_id=persisted_mission_id,
                         kind=current_kind,
                         title=current_title,
                         details=current_details,
@@ -873,17 +1385,149 @@ class AutonomyWorker:
                 self._journal("waiting_user", current_title, summary, task_id=persisted_task_id)
                 return
 
+            control_verdict = ""
+            if (
+                not user_signal_changed
+                and (
+                    continuation is not None
+                    or proposed_mission_status in {"continue_now", "follow_up_later", "blocked_user"}
+                    or (current_task is not None and current_task.continuation_count > 0)
+                )
+            ):
+                control_verdict, next_session_id = await self._run_control_pass(
+                    mission=mission,
+                    step_title=effective_title,
+                    step_result=result_text,
+                    proposed_mission_status=proposed_mission_status,
+                    proposed_stage_status=proposed_stage_status,
+                    proposed_next_title=continuation.title if continuation is not None else effective_title,
+                    proposed_next_details=continuation.details if continuation is not None else effective_details,
+                    proposed_delay_sec=continuation.delay_sec if continuation is not None else None,
+                    why_not_done_now=decision.why_not_done_now,
+                    blocker_type=decision.blocker_type,
+                    next_step_justification=decision.next_step_justification,
+                    session_id=session_id,
+                )
+                session_id = next_session_id
+                if session_id:
+                    self._queue_store.set_chat_session_id(chat_id, session_id)
+                if control_verdict == "FORCE_COMPLETE":
+                    proposed_mission_status = "complete"
+                    proposed_stage_status = "complete_mission"
+                    continuation = None
+                elif control_verdict == "FORCE_BLOCKED_USER":
+                    proposed_mission_status = "blocked_user"
+                    proposed_stage_status = "blocked_user"
+                    continuation = None
+                elif control_verdict == "FORCE_STAGE_DONE":
+                    proposed_stage_status = "stage_done"
+                elif control_verdict == "APPROVE_CONTINUE_NOW":
+                    proposed_mission_status = "continue_now"
+                elif control_verdict == "APPROVE_FOLLOWUP":
+                    proposed_mission_status = "follow_up_later"
+                elif control_verdict == "REJECT_AS_MICROSTEP":
+                    proposed_mission_status = "continue_now"
+                    if continuation is None:
+                        continuation = AutonomyContinuation(
+                            action="ENQUEUE",
+                            title=effective_title,
+                            kind=effective_kind,
+                            priority=effective_priority,
+                            delay_sec=0,
+                            details=effective_details or current_details or mission.current_focus or mission.root_objective,
+                        )
+
+            if mission.plan_state == "staged":
+                if proposed_stage_status == "stage_done":
+                    mission = self._advance_stage(
+                        mission,
+                        completion_summary=checkpoint_summary,
+                    )
+                    current_stage = self._current_stage(mission)
+                    if current_stage is None:
+                        proposed_stage_status = "complete_mission"
+                        proposed_mission_status = "complete"
+                        continuation = None
+                    else:
+                        stage_details = "\n".join(
+                            part
+                            for part in (
+                                current_stage.get("goal", "").strip(),
+                                (
+                                    f"Готовность этапа: {current_stage.get('done_when', '').strip()}"
+                                    if current_stage.get("done_when", "").strip()
+                                    else ""
+                                ),
+                            )
+                            if part
+                        ).strip()
+                        continuation = AutonomyContinuation(
+                            action="ENQUEUE",
+                            title=current_stage.get("title", "").strip() or effective_title,
+                            kind=effective_kind,
+                            priority=effective_priority,
+                            delay_sec=0,
+                            details=stage_details or effective_details or mission.current_focus or mission.root_objective,
+                        )
+                        if proposed_mission_status not in {"blocked_user", "complete"}:
+                            proposed_mission_status = (
+                                "continue_now"
+                                if (not user_signal_changed and step_index + 1 < self._settings.autonomy_session_step_limit)
+                                else "follow_up_later"
+                            )
+                elif proposed_stage_status == "blocked_user":
+                    mission = self._advance_stage(
+                        mission,
+                        completion_summary=checkpoint_summary,
+                        blocked=True,
+                    )
+                elif proposed_mission_status in {"continue_now", "follow_up_later"} and continuation is None:
+                    current_stage = self._current_stage(mission)
+                    if current_stage is not None:
+                        stage_details = "\n".join(
+                            part
+                            for part in (
+                                current_stage.get("goal", "").strip(),
+                                (
+                                    f"Готовность этапа: {current_stage.get('done_when', '').strip()}"
+                                    if current_stage.get("done_when", "").strip()
+                                    else ""
+                                ),
+                            )
+                            if part
+                        ).strip()
+                        continuation = AutonomyContinuation(
+                            action="ENQUEUE",
+                            title=current_stage.get("title", "").strip() or effective_title,
+                            kind=effective_kind,
+                            priority=effective_priority,
+                            delay_sec=0 if proposed_mission_status == "continue_now" else self._settings.autonomy_default_sleep_sec,
+                            details=stage_details or effective_details or mission.current_focus or mission.root_objective,
+                        )
+
             inline_continue = (
-                continuation is not None
-                and not user_signal_changed
-                and continuation.delay_sec <= 0
+                not user_signal_changed
+                and proposed_mission_status == "continue_now"
                 and step_index + 1 < self._settings.autonomy_session_step_limit
             )
             if inline_continue:
-                current_title = continuation.title.strip() or effective_title
-                current_kind = continuation.kind.strip() or effective_kind
-                current_details = continuation.details.strip() or effective_details
-                current_priority = continuation.priority
+                if continuation is not None:
+                    current_title = continuation.title.strip() or effective_title
+                    current_kind = continuation.kind.strip() or effective_kind
+                    current_details = continuation.details.strip() or effective_details
+                    current_priority = continuation.priority
+                else:
+                    current_title = effective_title
+                    current_kind = effective_kind
+                    current_details = effective_details
+                    current_priority = effective_priority
+                self._autonomy_store.update_mission(
+                    persisted_mission_id,
+                    status="active",
+                    current_focus=current_title,
+                    last_self_check_summary=self_check_summary,
+                )
+                mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
                 continue
 
             final_text = "\n\n".join(step_results).strip()
@@ -895,13 +1539,20 @@ class AutonomyWorker:
                 current_task is not None
                 and current_task.continuation_count >= self._settings.autonomy_max_task_continuations
             )
-            if continuation is not None and not user_signal_changed and continuation_limit_reached:
+            if (
+                continuation is not None
+                and proposed_mission_status == "follow_up_later"
+                and not user_signal_changed
+                and continuation_limit_reached
+            ):
                 final_text = (
                     f"{final_text}\n\n[autonomy-followup-suppressed: continuation limit reached]"
                 ).strip()
+                proposed_mission_status = "complete"
 
             if (
                 continuation is not None
+                and proposed_mission_status == "follow_up_later"
                 and not user_signal_changed
                 and not continuation_limit_reached
             ):
@@ -913,6 +1564,7 @@ class AutonomyWorker:
                 next_scheduled_for = self._scheduled_after(followup_delay_sec)
                 self._autonomy_store.continue_task(
                     persisted_task_id,
+                    mission_id=persisted_mission_id,
                     title=next_title,
                     details=next_details,
                     kind=next_kind,
@@ -933,6 +1585,12 @@ class AutonomyWorker:
                     source=persisted_task_source,
                     phase="scheduled",
                     scheduled_for=next_scheduled_for,
+                )
+                self._autonomy_store.update_mission(
+                    persisted_mission_id,
+                    status="active",
+                    current_focus=next_title,
+                    last_self_check_summary=self_check_summary,
                 )
                 self._schedule_mode(chat_id, "sleeping_scheduled", delay_sec=followup_delay_sec)
                 continued_task = True
@@ -958,11 +1616,17 @@ class AutonomyWorker:
                     ),
                 )
                 self._autonomy_store.clear_active_mission(chat_id)
+                self._autonomy_store.complete_mission(
+                    persisted_mission_id,
+                    current_focus=current_title,
+                    last_self_check_summary=self_check_summary,
+                )
             await self._maybe_notify_completion(
                 chat_id=chat_id,
                 task=AutonomyTask(
                     id=persisted_task_id,
                     chat_id=chat_id,
+                    mission_id=persisted_mission_id,
                     kind=current_kind,
                     title=current_title,
                     details=current_details,

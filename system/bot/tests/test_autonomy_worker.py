@@ -18,6 +18,7 @@ def _make_settings(
     *,
     autonomy_enabled: bool = True,
     autonomy_loop_poll_sec: int = 60,
+    autonomy_session_step_limit: int = 4,
 ) -> Settings:
     return Settings(
         assistant_root=root,
@@ -42,6 +43,7 @@ def _make_settings(
         autonomy_enabled=autonomy_enabled,
         autonomy_heartbeat_sec=1,
         autonomy_loop_poll_sec=autonomy_loop_poll_sec,
+        autonomy_session_step_limit=autonomy_session_step_limit,
         autonomy_notify_enabled=False,
         autonomy_notify_min_chars=20,
         autonomy_notify_cooldown_sec=60,
@@ -90,6 +92,21 @@ class _FakeBot:
 
 
 class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _write_active_request(root: Path, title: str, details: str = "") -> None:
+        ensure_autonomy_requests_scaffold(root)
+        target = root / "system" / "tasks" / "autonomy_requests.md"
+        lines = [
+            "# Автономные поручения",
+            "",
+            "## Активные",
+            "",
+            f"### {title}",
+        ]
+        if details:
+            lines.append(f"- details: {details}")
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     async def test_run_wakes_early_on_new_message_signal(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -136,6 +153,64 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 stop_event.set()
                 wake_event.set()
                 await run_task
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_owner_request_creates_root_mission_and_links_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_session_step_limit=1)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "ACTION: STEP",
+                            "TITLE: Собрать 3 источника",
+                            "KIND: research",
+                            "PRIORITY: 20",
+                            "DETAILS:",
+                            "Собрать базовый набор источников.",
+                            "RESULT:",
+                            "Собрал базовый набор источников по задаче владельца.",
+                            "MISSION_STATUS: complete",
+                            "WHY_NOT_DONE_NOW: Всё, что нужно для checkpoint, уже сделано.",
+                            "BLOCKER_TYPE: none",
+                            "GOAL_CHECK: Это напрямую закрывает текущий owner-request.",
+                            "PROGRESS_DELTA: Источники собраны.",
+                            "DRIFT_RISK: Низкий.",
+                            "WHY_NOT_FINISHED_NOW: completed now",
+                            "NEXT_STEP_JUSTIFICATION: no follow-up needed",
+                        ]
+                    ),
+                    "session-owner",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                self._write_active_request(
+                    root,
+                    "Подготовить исследование по рынку",
+                    "Собрать сильные источники и коротко их оценить.",
+                )
+                await worker._run_once()
+
+                done = autonomy_store.list_tasks(chat_id=101, statuses={"done"})
+                self.assertEqual(len(done), 1)
+                self.assertIsNotNone(done[0].mission_id)
+                mission = autonomy_store.get_mission(done[0].mission_id or 0)
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.source, "owner_request")
+                self.assertIn("Подготовить исследование по рынку", mission.root_objective)
+                self.assertEqual(mission.status, "completed")
+            finally:
                 queue_store.close()
                 autonomy_store.close()
 
@@ -758,6 +833,7 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
         task = AutonomyTask(
             id=1,
             chat_id=101,
+            mission_id=None,
             kind="research",
             title="Разобрать Ouroboros",
             details="",
@@ -793,6 +869,7 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
         task = AutonomyTask(
             id=1,
             chat_id=101,
+            mission_id=None,
             kind="note",
             title="Подготовить Markdown",
             details="",
@@ -832,6 +909,7 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
         task = AutonomyTask(
             id=1,
             chat_id=101,
+            mission_id=None,
             kind="project",
             title="Докрутить pulse",
             details="",
@@ -868,6 +946,7 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
         task = AutonomyTask(
             id=1,
             chat_id=101,
+            mission_id=None,
             kind="project",
             title="Докрутить silent updates",
             details="",
@@ -1304,6 +1383,16 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                         True,
                         "\n".join(
                             [
+                                "VERDICT: APPROVE_CONTINUE_NOW",
+                                "REASON: Локальный хвост лучше дожать в этом же сеансе.",
+                            ]
+                        ),
+                        "session-5",
+                    ),
+                    CodexRunResult(
+                        True,
+                        "\n".join(
+                            [
                                 "ACTION: STEP",
                                 "TITLE: Исправить причину бага",
                                 "KIND: maintenance",
@@ -1333,7 +1422,105 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(pending), 0)
                 self.assertIn("Нашёл корень проблемы.", done[0].result_text)
                 self.assertIn("Исправил баг и проверил результат.", done[0].result_text)
-                self.assertEqual(len(runner.calls), 2)
+                self.assertEqual(len(runner.calls), 3)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_once_rejects_micro_followup_and_finishes_in_same_session(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _SequenceRunner(
+                [
+                    CodexRunResult(
+                        True,
+                        "\n".join(
+                            [
+                                "ACTION: STEP",
+                                "TITLE: Подготовить owner-facing сводку",
+                                "KIND: project",
+                                "PRIORITY: 20",
+                                "DETAILS:",
+                                "Сделать основной шаг по сводке.",
+                                "RESULT:",
+                                "Сделал основной шаг по сводке.",
+                                "MISSION_STATUS: follow_up_later",
+                                "WHY_NOT_DONE_NOW: Остался маленький косметический хвост.",
+                                "BLOCKER_TYPE: none",
+                                "GOAL_CHECK: Основная часть миссии уже закрыта.",
+                                "PROGRESS_DELTA: Готова почти вся сводка.",
+                                "DRIFT_RISK: Есть риск зря дробить хвост.",
+                                "WHY_NOT_FINISHED_NOW: Остался очень маленький хвост.",
+                                "NEXT_STEP_JUSTIFICATION: Хочу вынести косметику в отдельный wake-up.",
+                                "",
+                                "[[autonomy-next]]",
+                                "ACTION: ENQUEUE",
+                                "TITLE: Докрутить крошечный хвост",
+                                "KIND: project",
+                                "PRIORITY: 30",
+                                "DELAY_SEC: 120",
+                                "DETAILS:",
+                                "Переименовать одну строку и вернуться позже.",
+                                "[[/autonomy-next]]",
+                            ]
+                        ),
+                        "session-micro",
+                    ),
+                    CodexRunResult(
+                        True,
+                        "\n".join(
+                            [
+                                "VERDICT: REJECT_AS_MICROSTEP",
+                                "REASON: Этот хвост нужно дожать сейчас в том же сеансе.",
+                            ]
+                        ),
+                        "session-micro",
+                    ),
+                    CodexRunResult(
+                        True,
+                        "\n".join(
+                            [
+                                "ACTION: STEP",
+                                "TITLE: Закрыть owner-facing сводку",
+                                "KIND: project",
+                                "PRIORITY: 20",
+                                "DETAILS:",
+                                "Дожать косметический хвост и проверить итог.",
+                                "RESULT:",
+                                "Дожал хвост и закрыл owner-facing сводку без нового wake-up.",
+                                "MISSION_STATUS: complete",
+                                "WHY_NOT_DONE_NOW: Всё завершено.",
+                                "BLOCKER_TYPE: none",
+                                "GOAL_CHECK: Миссия полностью закрыта.",
+                                "PROGRESS_DELTA: Хвост устранён.",
+                                "DRIFT_RISK: Низкий.",
+                                "WHY_NOT_FINISHED_NOW: completed now",
+                                "NEXT_STEP_JUSTIFICATION: no follow-up needed",
+                            ]
+                        ),
+                        "session-micro",
+                    ),
+                ]
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Собрать owner-facing сводку", kind="project")
+
+                await worker._run_once()
+
+                done = autonomy_store.list_tasks(chat_id=101, statuses={"done"})
+                pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
+                self.assertEqual(len(done), 1)
+                self.assertEqual(len(pending), 0)
+                self.assertIn("Дожал хвост", done[0].result_text)
+                self.assertEqual(len(runner.calls), 3)
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -1577,6 +1764,187 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 done = autonomy_store.list_tasks(chat_id=101, statuses={"done"})
                 self.assertEqual(len(done), 1)
                 self.assertIn("autonomy-paused", done[0].result_text)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_owner_request_can_start_staged_mission_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _SequenceRunner(
+                [
+                    CodexRunResult(
+                        True,
+                        "\n".join(
+                            [
+                                "ACTION: STEP",
+                                "TITLE: Собрать материалы",
+                                "KIND: research",
+                                "PRIORITY: 20",
+                                "DETAILS:",
+                                "Составить план работы и открыть первый этап.",
+                                "RESULT:",
+                                "План миссии собран, первый этап открыт.",
+                                "PLAN_MODE: staged",
+                                "ROOT_OBJECTIVE: Собрать методичку по теме",
+                                "SUCCESS_CRITERIA: Есть готовый документ с вычитанными разделами.",
+                                "CURRENT_STAGE: Сбор материалов",
+                                "NEXT_STAGE: Черновик",
+                                "MISSION_STATUS: follow_up_later",
+                                "STAGE_STATUS: continue_stage",
+                                "CHECKPOINT_SUMMARY: План готов и первый этап активен.",
+                                "WHY_NOT_DONE_NOW: Дальше уже отдельный этап работы.",
+                                "BLOCKER_TYPE: none",
+                                "GOAL_CHECK: Это создаёт внятную рамку миссии.",
+                                "PROGRESS_DELTA: Этапы определены.",
+                                "DRIFT_RISK: Низкий.",
+                                "WHY_NOT_FINISHED_NOW: Остались этапы выполнения.",
+                                "NEXT_STEP_JUSTIFICATION: Нужно продолжить текущий этап.",
+                                "",
+                                "[[mission-plan]]",
+                                "### Сбор материалов",
+                                "goal: собрать опорные источники",
+                                "done_when: есть 5 сильных источников",
+                                "status: active",
+                                "completion_summary: ",
+                                "### Черновик",
+                                "goal: написать основной текст",
+                                "done_when: готов первый черновик",
+                                "status: pending",
+                                "completion_summary: ",
+                                "### Вычитка",
+                                "goal: проверить цельность текста",
+                                "done_when: финальная версия вычитана",
+                                "status: pending",
+                                "completion_summary: ",
+                                "[[/mission-plan]]",
+                            ]
+                        ),
+                        "session-plan",
+                    ),
+                    CodexRunResult(
+                        True,
+                        "VERDICT: APPROVE_FOLLOWUP\nREASON: План создан, продолжение оправдано на следующем wake-up.",
+                        "session-plan",
+                    ),
+                ]
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                self._write_active_request(root, "Собрать методичку по теме")
+
+                await worker._run_once()
+
+                mission = autonomy_store.get_live_mission(101, source="owner_request")
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.plan_state, "staged")
+                self.assertEqual(len(mission.plan_json), 3)
+                self.assertEqual(mission.current_stage_index, 0)
+                self.assertEqual(mission.plan_json[0]["title"], "Сбор материалов")
+                pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
+                self.assertEqual(len(pending), 1)
+                self.assertIn("Сбор материалов", pending[0].title)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_force_stage_done_advances_to_next_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_session_step_limit=1)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _SequenceRunner(
+                [
+                    CodexRunResult(
+                        True,
+                        "\n".join(
+                            [
+                                "ACTION: STEP",
+                                "TITLE: Сбор материалов",
+                                "KIND: research",
+                                "PRIORITY: 20",
+                                "DETAILS:",
+                                "Дособрать и зафиксировать материалы.",
+                                "RESULT:",
+                                "Материалы уже собраны, остался только косметический хвост.",
+                                "PLAN_MODE: staged",
+                                "ROOT_OBJECTIVE: Собрать методичку по теме",
+                                "SUCCESS_CRITERIA: Есть готовый документ с вычитанными разделами.",
+                                "CURRENT_STAGE: Сбор материалов",
+                                "NEXT_STAGE: Черновик",
+                                "MISSION_STATUS: follow_up_later",
+                                "STAGE_STATUS: continue_stage",
+                                "CHECKPOINT_SUMMARY: Материалы фактически готовы.",
+                                "WHY_NOT_DONE_NOW: Хочу ещё один маленький хвост.",
+                                "BLOCKER_TYPE: none",
+                                "GOAL_CHECK: Это завершает первый этап.",
+                                "PROGRESS_DELTA: Все материалы уже на месте.",
+                                "DRIFT_RISK: Есть риск микродробления.",
+                                "WHY_NOT_FINISHED_NOW: Остался следующий этап.",
+                                "NEXT_STEP_JUSTIFICATION: Хочу отложить маленький хвост.",
+                                "",
+                                "[[mission-plan]]",
+                                "### Сбор материалов",
+                                "goal: собрать опорные источники",
+                                "done_when: есть 5 сильных источников",
+                                "status: active",
+                                "completion_summary: ",
+                                "### Черновик",
+                                "goal: написать основной текст",
+                                "done_when: готов первый черновик",
+                                "status: pending",
+                                "completion_summary: ",
+                                "[[/mission-plan]]",
+                                "",
+                                "[[autonomy-next]]",
+                                "ACTION: ENQUEUE",
+                                "TITLE: Ещё один мелкий хвост",
+                                "KIND: research",
+                                "PRIORITY: 20",
+                                "DELAY_SEC: 60",
+                                "DETAILS:",
+                                "Доделать косметический хвост позже.",
+                                "[[/autonomy-next]]",
+                            ]
+                        ),
+                        "session-stage",
+                    ),
+                    CodexRunResult(
+                        True,
+                        "VERDICT: FORCE_STAGE_DONE\nREASON: Этап уже закрыт, хвост слишком мелкий.",
+                        "session-stage",
+                    ),
+                ]
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                self._write_active_request(root, "Собрать методичку по теме")
+
+                await worker._run_once()
+
+                mission = autonomy_store.get_live_mission(101, source="owner_request")
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.plan_state, "staged")
+                self.assertEqual(mission.current_stage_index, 1)
+                self.assertEqual(mission.plan_json[0]["status"], "done")
+                self.assertIn("Материалы фактически готовы", mission.plan_json[0]["completion_summary"])
+                pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
+                self.assertEqual(len(pending), 1)
+                self.assertIn("Черновик", pending[0].title)
             finally:
                 queue_store.close()
                 autonomy_store.close()

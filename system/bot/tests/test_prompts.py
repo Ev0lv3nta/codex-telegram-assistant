@@ -1,6 +1,10 @@
 import unittest
 
-from system.bot.prompts import build_autonomy_wakeup_prompt, build_prompt
+from system.bot.prompts import (
+    build_autonomy_control_prompt,
+    build_autonomy_wakeup_prompt,
+    build_prompt,
+)
 
 
 class PromptTests(unittest.TestCase):
@@ -55,6 +59,19 @@ class PromptTests(unittest.TestCase):
             current_task_title="Подготовить идею",
             current_task_details="Сделать один шаг и не уходить в длинную миссию",
             current_task_kind="research",
+            mission_source="owner_request",
+            mission_root_objective="Подготовить исследование по рынку",
+            mission_success_criteria="Дойти до заметного checkpoint и не дробить работу.",
+            mission_plan_state="staged",
+            mission_current_stage="Сбор материалов",
+            mission_current_stage_goal="Собрать опорные источники",
+            mission_current_stage_done_when="Есть 5 сильных источников",
+            mission_next_stage="Сбор черновика",
+            mission_current_focus="Собрать 3 сильных источника",
+            mission_last_checkpoint="Один сильный источник уже найден.",
+            mission_last_self_check="goal: рынок | progress: пока только 1 источник",
+            mission_recent_checkpoints=["Первый источник уже подтверждён."],
+            mission_recent_lines=["#4 [done] Собрать первый источник — источник уже найден"],
             recent_task_lines=["#5 [done] Старая задача — без нового результата"],
             recent_journal_lines=["## 10:30 · completed - Итог: сделал краткий шаг"],
             recent_user_lines=["Я сейчас изучаю юнит-экономику"],
@@ -81,6 +98,18 @@ class PromptTests(unittest.TestCase):
         self.assertIn("DELAY_SEC", prompt)
         self.assertIn("ACTION: STEP", prompt)
         self.assertIn("ACTION: NOOP", prompt)
+        self.assertIn("Миссионный контракт текущего автономного сеанса", prompt)
+        self.assertIn("root objective: Подготовить исследование по рынку", prompt)
+        self.assertIn("plan state: staged", prompt)
+        self.assertIn("current stage: Сбор материалов", prompt)
+        self.assertIn("next stage: Сбор черновика", prompt)
+        self.assertIn("MISSION_STATUS:", prompt)
+        self.assertIn("PLAN_MODE:", prompt)
+        self.assertIn("STAGE_STATUS:", prompt)
+        self.assertIn("CHECKPOINT_SUMMARY:", prompt)
+        self.assertIn("[[mission-plan]]", prompt)
+        self.assertIn("GOAL_CHECK:", prompt)
+        self.assertIn("NEXT_STEP_JUSTIFICATION:", prompt)
         self.assertIn("Не выбирай шаги, чей единственный результат", prompt)
         self.assertIn("Не дроби задачу на микрошаги", prompt)
         self.assertIn("AGENTS.md", prompt)
@@ -129,6 +158,31 @@ class PromptTests(unittest.TestCase):
         self.assertIn("/root/personal-assistant/topics/autonomy-companion-plan.md", prompt)
         self.assertIn("Не дёргай владельца по каждой мелочи", prompt)
         self.assertIn("AGENTS.md", prompt)
+
+    def test_autonomy_control_prompt_demands_strict_verdict(self) -> None:
+        prompt = build_autonomy_control_prompt(
+            mission_source="owner_request",
+            mission_root_objective="Довести owner-facing статус до понятного вида",
+            mission_success_criteria="Показать корневую миссию и текущий фокус без микродробления.",
+            mission_current_focus="Проверить pulse",
+            mission_recent_lines=["#8 [done] Показать root mission в status"],
+            step_title="Сделать ещё один крошечный follow-up",
+            step_result="Сделал маленький косметический хвост.",
+            proposed_mission_status="follow_up_later",
+            proposed_next_title="Ещё один крошечный follow-up",
+            proposed_next_details="Переименовать одну строку и вернуться позже.",
+            proposed_delay_sec=120,
+            why_not_done_now="Не захотел дожимать сразу.",
+            blocker_type="none",
+            next_step_justification="Хочу разбить на ещё один шаг.",
+        )
+        self.assertIn("VERDICT: APPROVE_CONTINUE_NOW", prompt)
+        self.assertIn("FORCE_STAGE_DONE", prompt)
+        self.assertIn("REJECT_AS_MICROSTEP", prompt)
+        self.assertIn("root objective: Довести owner-facing статус", prompt)
+        self.assertIn("current stage", prompt)
+        self.assertIn("current stage done when", prompt)
+        self.assertIn("next-step justification: Хочу разбить", prompt)
 
 
 if __name__ == "__main__":

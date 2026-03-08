@@ -230,6 +230,143 @@ class AutonomyStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_create_and_update_root_mission(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                mission_id = store.create_mission(
+                    chat_id=101,
+                    source="owner_request",
+                    root_objective="Подготовить исследование по рынку",
+                    success_criteria="Дойти до заметного checkpoint без микродробления.",
+                    current_focus="Собрать 3 сильных источника",
+                )
+                mission = store.get_live_mission(101, source="owner_request")
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.id, mission_id)
+                self.assertEqual(mission.root_objective, "Подготовить исследование по рынку")
+                self.assertEqual(mission.current_focus, "Собрать 3 сильных источника")
+
+                store.update_mission(
+                    mission_id,
+                    current_focus="Свести выводы",
+                    last_self_check_summary="goal: рынок | progress: собраны 3 источника",
+                )
+                updated = store.get_mission(mission_id)
+                self.assertIsNotNone(updated)
+                assert updated is not None
+                self.assertEqual(updated.current_focus, "Свести выводы")
+                self.assertIn("собраны 3 источника", updated.last_self_check_summary)
+
+                store.complete_mission(mission_id, current_focus="Сводка готова")
+                completed = store.get_mission(mission_id)
+                self.assertIsNotNone(completed)
+                assert completed is not None
+                self.assertEqual(completed.status, "completed")
+                self.assertEqual(completed.current_focus, "Сводка готова")
+                self.assertIsNotNone(completed.completed_at)
+            finally:
+                store.close()
+
+    def test_mission_plan_fields_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                mission_id = store.create_mission(
+                    chat_id=101,
+                    source="owner_request",
+                    root_objective="Собрать методичку",
+                    success_criteria="Готов связный документ.",
+                    plan_state="staged",
+                    plan_json=[
+                        {
+                            "title": "Сбор материалов",
+                            "goal": "Собрать опорные источники",
+                            "done_when": "Есть 5 сильных источников",
+                            "status": "active",
+                            "completion_summary": "",
+                        },
+                        {
+                            "title": "Черновик",
+                            "goal": "Написать основной текст",
+                            "done_when": "Готов первый черновик",
+                            "status": "pending",
+                            "completion_summary": "",
+                        },
+                    ],
+                    current_stage_index=0,
+                    current_focus="Сбор материалов",
+                    plan_updated_at="2026-03-08T10:00:00+00:00",
+                    last_checkpoint_summary="План создан.",
+                )
+                mission = store.get_mission(mission_id)
+                self.assertIsNotNone(mission)
+                assert mission is not None
+                self.assertEqual(mission.plan_state, "staged")
+                self.assertEqual(len(mission.plan_json), 2)
+                self.assertEqual(mission.plan_json[0]["title"], "Сбор материалов")
+                self.assertEqual(mission.current_stage_index, 0)
+                self.assertEqual(mission.last_checkpoint_summary, "План создан.")
+
+                store.update_mission(
+                    mission_id,
+                    current_stage_index=1,
+                    plan_json=[
+                        {
+                            "title": "Сбор материалов",
+                            "goal": "Собрать опорные источники",
+                            "done_when": "Есть 5 сильных источников",
+                            "status": "done",
+                            "completion_summary": "Источники собраны.",
+                        },
+                        {
+                            "title": "Черновик",
+                            "goal": "Написать основной текст",
+                            "done_when": "Готов первый черновик",
+                            "status": "active",
+                            "completion_summary": "",
+                        },
+                    ],
+                    last_checkpoint_summary="Первый этап закрыт.",
+                )
+                updated = store.get_mission(mission_id)
+                self.assertIsNotNone(updated)
+                assert updated is not None
+                self.assertEqual(updated.current_stage_index, 1)
+                self.assertEqual(updated.plan_json[0]["status"], "done")
+                self.assertEqual(updated.last_checkpoint_summary, "Первый этап закрыт.")
+            finally:
+                store.close()
+
+    def test_task_can_be_linked_to_mission_and_listed_back(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                mission_id = store.create_mission(
+                    chat_id=101,
+                    source="initiative",
+                    root_objective="Привести pulse в порядок",
+                    success_criteria="Сделать owner-facing слой понятнее.",
+                )
+                task_id = store.enqueue_task(
+                    chat_id=101,
+                    mission_id=mission_id,
+                    title="Упростить pulse",
+                    kind="project",
+                )
+                task = store.get_next_pending_task(101)
+                self.assertIsNotNone(task)
+                assert task is not None
+                self.assertEqual(task.mission_id, mission_id)
+
+                mission_tasks = store.list_mission_tasks(mission_id, limit=5)
+                self.assertEqual(len(mission_tasks), 1)
+                self.assertEqual(mission_tasks[0].id, task_id)
+                self.assertEqual(mission_tasks[0].mission_id, mission_id)
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
