@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -59,7 +59,12 @@ class _FakeRunner:
         self._result = result
         self.calls: list[tuple[str, str]] = []
 
-    def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
+    def run(
+        self,
+        prompt: str,
+        session_id: str = "",
+        timeout_sec: int | None = None,
+    ) -> CodexRunResult:
         self.calls.append((prompt, session_id))
         return self._result
 
@@ -69,7 +74,12 @@ class _SequenceRunner:
         self._results = list(results)
         self.calls: list[tuple[str, str]] = []
 
-    def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
+    def run(
+        self,
+        prompt: str,
+        session_id: str = "",
+        timeout_sec: int | None = None,
+    ) -> CodexRunResult:
         self.calls.append((prompt, session_id))
         if not self._results:
             raise AssertionError("No more prepared runner results.")
@@ -210,6 +220,57 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(mission.source, "owner_request")
                 self.assertIn("Подготовить исследование по рынку", mission.root_objective)
                 self.assertEqual(mission.status, "completed")
+                self.assertEqual(autonomy_store.get_mode(101), "cooldown")
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_completed_mission_without_active_requests_enters_long_sleep(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_session_step_limit=1)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "ACTION: STEP",
+                            "TITLE: Закрыть сводку",
+                            "KIND: research",
+                            "PRIORITY: 20",
+                            "DETAILS:",
+                            "Собрать краткий итог.",
+                            "RESULT:",
+                            "Сводка готова.",
+                            "MISSION_STATUS: complete",
+                            "WHY_NOT_DONE_NOW: Всё завершено.",
+                            "BLOCKER_TYPE: none",
+                            "GOAL_CHECK: Миссия закрыта.",
+                            "PROGRESS_DELTA: Итог собран.",
+                            "DRIFT_RISK: Низкий.",
+                            "WHY_NOT_FINISHED_NOW: completed now",
+                            "NEXT_STEP_JUSTIFICATION: no follow-up needed",
+                        ]
+                    ),
+                    "session-complete",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Собрать сводку", kind="research")
+
+                await worker._run_once()
+
+                self.assertEqual(autonomy_store.get_mode(101), "sleeping_completed")
+                self.assertEqual(autonomy_store.get_last_heartbeat_kind(), "sleeping_completed")
+                next_wakeup = autonomy_store.get_next_wakeup(101)
+                self.assertTrue(next_wakeup)
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -351,6 +412,65 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 queue_store.close()
                 autonomy_store.close()
 
+    async def test_run_once_blocks_when_guard_call_budget_is_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(CodexRunResult(True, "should not run", "session-1"))
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Guarded task", kind="research")
+                now = datetime.now(timezone.utc)
+                autonomy_store.set_guard_recent_call_timestamps(
+                    101,
+                    [
+                        (now - timedelta(minutes=5)).isoformat(),
+                        (now - timedelta(minutes=15)).isoformat(),
+                        (now - timedelta(minutes=25)).isoformat(),
+                    ],
+                )
+                await worker._run_once()
+
+                self.assertEqual(len(runner.calls), 0)
+                self.assertTrue(autonomy_store.guard_waiting_approval(101))
+                self.assertEqual(autonomy_store.get_mode(101), "guard_waiting_approval")
+                self.assertEqual(len(bot.messages), 1)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_run_once_enters_guard_when_autonomy_call_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_session_step_limit=1)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(False, "Codex execution timed out", "", timed_out=True)
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.enqueue_task(chat_id=101, title="Long running task", kind="research")
+                await worker._run_once()
+
+                self.assertEqual(len(runner.calls), 1)
+                self.assertTrue(autonomy_store.guard_waiting_approval(101))
+                self.assertEqual(autonomy_store.get_mode(101), "guard_waiting_approval")
+                self.assertEqual(len(bot.messages), 1)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
     async def test_run_once_executes_spontaneous_wakeup_step_when_backlog_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -468,7 +588,12 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self) -> None:
                     self.calls: list[tuple[str, str]] = []
 
-                def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
+                def run(
+                    self,
+                    prompt: str,
+                    session_id: str = "",
+                    timeout_sec: int | None = None,
+                ) -> CodexRunResult:
                     self.calls.append((prompt, session_id))
                     queue_store.enqueue_task(
                         chat_id=101,
@@ -1002,8 +1127,9 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(len(bot.messages), 0)
                 self.assertEqual(len(runner.calls), 0)
-                self.assertEqual(autonomy_store.get_last_heartbeat_kind(), "sleeping_idle")
-                self.assertEqual(autonomy_store.get_mode(101), "idle")
+                self.assertEqual(autonomy_store.get_last_heartbeat_kind(), "sleeping_empty_idle")
+                self.assertEqual(autonomy_store.get_mode(101), "sleeping_empty_idle")
+                self.assertTrue(autonomy_store.idle_snoozed(101))
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -1050,6 +1176,7 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(bot.messages), 0)
                 self.assertEqual(autonomy_store.get_last_heartbeat_kind(), "sleeping_user_declined")
                 self.assertTrue(autonomy_store.idle_snoozed(101))
+                self.assertEqual(autonomy_store.get_mode(101), "sleeping_user_declined")
             finally:
                 queue_store.close()
                 autonomy_store.close()
@@ -1721,7 +1848,12 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self) -> None:
                     self.calls: list[tuple[str, str]] = []
 
-                def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
+                def run(
+                    self,
+                    prompt: str,
+                    session_id: str = "",
+                    timeout_sec: int | None = None,
+                ) -> CodexRunResult:
                     self.calls.append((prompt, session_id))
                     queue_store.enqueue_task(
                         chat_id=101,
@@ -1945,6 +2077,175 @@ class AutonomyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 pending = autonomy_store.list_tasks(chat_id=101, statuses={"pending"})
                 self.assertEqual(len(pending), 1)
                 self.assertIn("Черновик", pending[0].title)
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_due_schedule_materializes_single_autonomy_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_session_step_limit=1)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "ACTION: STEP",
+                            "TITLE: Daily digest",
+                            "KIND: scheduled",
+                            "PRIORITY: 20",
+                            "DETAILS:",
+                            "Подготовить digest.",
+                            "RESULT:",
+                            "Digest готов.",
+                            "MISSION_STATUS: complete",
+                            "WHY_NOT_DONE_NOW: Всё завершено.",
+                            "BLOCKER_TYPE: none",
+                            "GOAL_CHECK: Расписание отработано.",
+                            "PROGRESS_DELTA: Дайджест собран.",
+                            "DRIFT_RISK: Низкий.",
+                            "WHY_NOT_FINISHED_NOW: completed now",
+                            "NEXT_STEP_JUSTIFICATION: no follow-up needed",
+                        ]
+                    ),
+                    "session-schedule",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                schedule_id = autonomy_store.create_schedule(
+                    chat_id=101,
+                    title="Daily digest",
+                    prompt_text="Подготовь ежедневную сводку.",
+                    timezone="Europe/Moscow",
+                    recurrence_kind="daily",
+                    recurrence_json={"time": "20:00"},
+                    next_run_at="2026-03-08T10:00:00+00:00",
+                    delivery_hint="html",
+                )
+                autonomy_store.set_next_wakeup(101, "2026-03-08T10:00:00+00:00")
+
+                await worker._run_once()
+
+                tasks = autonomy_store.list_tasks(chat_id=101, limit=10, order_by="recent")
+                self.assertEqual(len(tasks), 1)
+                self.assertEqual(tasks[0].source, "scheduled")
+                self.assertEqual(tasks[0].schedule_id, schedule_id)
+                schedule = autonomy_store.get_schedule(schedule_id, chat_id=101)
+                self.assertIsNotNone(schedule)
+                assert schedule is not None
+                self.assertEqual(schedule.last_status, "completed")
+                self.assertNotEqual(schedule.next_run_at, "2026-03-08T10:00:00+00:00")
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_schedule_wakeup_takes_precedence_over_long_sleep(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(CodexRunResult(True, "ACTION: NOOP", "session-idle"))
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                autonomy_store.create_schedule(
+                    chat_id=101,
+                    title="Evening dashboard",
+                    prompt_text="Собери вечерний дашборд.",
+                    timezone="Europe/Moscow",
+                    recurrence_kind="daily",
+                    recurrence_json={"time": "20:00"},
+                    next_run_at="2026-03-08T17:00:00+00:00",
+                )
+
+                worker._schedule_sleeping_empty_idle(101)
+
+                self.assertEqual(
+                    autonomy_store.get_next_wakeup(101),
+                    "2026-03-08T17:00:00+00:00",
+                )
+            finally:
+                queue_store.close()
+                autonomy_store.close()
+
+    async def test_scheduled_task_prompt_isolated_from_recent_user_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            settings = _make_settings(root, autonomy_session_step_limit=1)
+            queue_store = QueueStore(root / "state.db")
+            autonomy_store = AutonomyStore(root / "state.db")
+            stop_event = asyncio.Event()
+            runner = _FakeRunner(
+                CodexRunResult(
+                    True,
+                    "\n".join(
+                        [
+                            "ACTION: STEP",
+                            "TITLE: Daily digest",
+                            "KIND: scheduled",
+                            "PRIORITY: 20",
+                            "DETAILS:",
+                            "Подготовить digest.",
+                            "RESULT:",
+                            "Digest готов.",
+                            "MISSION_STATUS: complete",
+                            "WHY_NOT_DONE_NOW: Всё завершено.",
+                            "BLOCKER_TYPE: none",
+                            "GOAL_CHECK: Расписание отработано.",
+                            "PROGRESS_DELTA: Дайджест собран.",
+                            "DRIFT_RISK: Низкий.",
+                            "WHY_NOT_FINISHED_NOW: completed now",
+                            "NEXT_STEP_JUSTIFICATION: no follow-up needed",
+                        ]
+                    ),
+                    "session-schedule",
+                )
+            )
+            bot = _FakeBot()
+            worker = AutonomyWorker(settings, queue_store, autonomy_store, bot, runner, stop_event)
+
+            try:
+                queue_store.note_chat_activity(101)
+                task_id = queue_store.enqueue_task(
+                    chat_id=101,
+                    user_id=1,
+                    username="tester",
+                    text="Почему мне ничего не пришло?",
+                    attachments=[],
+                )
+                claimed = queue_store.claim_next_task()
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                queue_store.complete_task(task_id, "done")
+
+                autonomy_store.create_schedule(
+                    chat_id=101,
+                    title="Daily digest",
+                    prompt_text="Подготовь ежедневную сводку.",
+                    timezone="Europe/Moscow",
+                    recurrence_kind="daily",
+                    recurrence_json={"time": "20:00"},
+                    next_run_at="2026-03-08T10:00:00+00:00",
+                )
+                autonomy_store.set_next_wakeup(101, "2026-03-08T10:00:00+00:00")
+
+                await worker._run_once()
+
+                self.assertTrue(runner.calls)
+                prompt, session_id = runner.calls[0]
+                self.assertEqual(session_id, "")
+                self.assertNotIn("Почему мне ничего не пришло?", prompt)
             finally:
                 queue_store.close()
                 autonomy_store.close()

@@ -268,7 +268,7 @@ class AutonomyStatusRenderTests(unittest.TestCase):
         commands = _build_bot_commands()
         self.assertEqual(
             [item.command for item in commands],
-            ["start", "pulse", "status", "codexstatus", "autonomy", "restart"],
+            ["start", "pulse", "status", "codexstatus", "schedules", "autonomy", "restart"],
         )
 
     def test_render_codex_cli_status_reads_local_limits(self) -> None:
@@ -382,6 +382,16 @@ class AutonomyStatusRenderTests(unittest.TestCase):
         start_button = markup.inline_keyboard[1][0]
         self.assertEqual(start_button.text, "Запустить автономность")
         self.assertEqual(start_button.callback_data, "autonomy:pulse:start")
+
+    def test_build_pulse_keyboard_shows_guard_actions_when_waiting_approval(self) -> None:
+        markup = _build_pulse_keyboard(guard_waiting=True)
+        self.assertEqual(len(markup.inline_keyboard), 3)
+        approve_button = markup.inline_keyboard[1][0]
+        stop_button = markup.inline_keyboard[2][0]
+        self.assertEqual(approve_button.text, "Разрешить один сеанс")
+        self.assertEqual(approve_button.callback_data, "autonomy:guard:approve_once")
+        self.assertEqual(stop_button.text, "Остановить автономность")
+        self.assertEqual(stop_button.callback_data, "autonomy:guard:stop")
 
     def test_render_autonomy_status_includes_meta_and_followup_chain(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -519,6 +529,34 @@ class AutonomyStatusRenderTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_render_autonomy_pulse_shows_completed_sleep_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "sleeping_completed")
+                store.set_next_wakeup(101, "2026-03-08T03:00:00+00:00")
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("статус: миссия завершена, спит до 08.03 06:00 MSK", text)
+                self.assertIn("причина следующего wake-up: контрольная проверка после завершения миссии", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_shows_empty_idle_sleep_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "sleeping_empty_idle")
+                store.set_next_wakeup(101, "2026-03-08T03:00:00+00:00")
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("статус: активных задач нет, спит до 08.03 06:00 MSK", text)
+                self.assertIn("причина следующего wake-up: редкая idle-проверка без активных задач", text)
+            finally:
+                store.close()
+
     def test_render_autonomy_pulse_prefers_waiting_phase_status(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = AutonomyStore(Path(td) / "state.db")
@@ -538,6 +576,31 @@ class AutonomyStatusRenderTests(unittest.TestCase):
 
                 self.assertIn("текущая линия: Уточнить следующий шаг у владельца", text)
                 self.assertIn("статус: ждёт ответа владельца", text)
+            finally:
+                store.close()
+
+    def test_render_autonomy_pulse_shows_guard_waiting_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "state.db")
+            try:
+                store.set_mode(101, "guard_waiting_approval")
+                store.set_guard_waiting_approval(101, True)
+                store.set_guard_block_reason(101, "too_many_calls")
+                store.set_guard_session_started_at(101, "2026-03-08T03:00:00+00:00")
+                store.set_guard_recent_call_timestamps(
+                    101,
+                    [
+                        "2026-03-08T03:05:00+00:00",
+                        "2026-03-08T03:10:00+00:00",
+                        "2026-03-08T03:15:00+00:00",
+                    ],
+                )
+
+                text = _render_autonomy_pulse(store, 101)
+
+                self.assertIn("guard остановил автономность", text)
+                self.assertIn("причина guard: too_many_calls", text)
+                self.assertIn("ждёт твоего разрешения продолжить", text)
             finally:
                 store.close()
 

@@ -20,7 +20,12 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from .autonomy_store import AutonomyStore
+from .autonomy_guard import (
+    GUARD_APPROVE_CALLBACK_DATA,
+    GUARD_STOP_CALLBACK_DATA,
+    build_guard_keyboard,
+)
+from .autonomy_store import AutonomySchedule, AutonomyStore
 from .autonomy_worker import AutonomyWorker
 from .autonomy_requests import ensure_autonomy_requests_scaffold
 from .codex_runner import CodexRunner
@@ -29,6 +34,14 @@ from .ingest import download_attachments
 from .memory_store import ensure_memory_scaffold
 from .queue_store import QueueStore
 from .session_gc import _extract_session_id
+from .schedule_parser import (
+    DEFAULT_TIMEZONE,
+    ScheduleIntent,
+    build_schedule_intent_prompt,
+    compute_next_run_at,
+    describe_recurrence,
+    parse_schedule_intent_response,
+)
 from .self_restart import (
     consume_restart_notification_target,
     mark_restart_observed,
@@ -58,6 +71,7 @@ HELP_TEXT = """
 - `/pulse` показывает короткий owner-facing пульс автономности.
 - `/status` показывает состояние очереди.
 - `/codexstatus` показывает модель и usage-лимиты Codex CLI.
+- `/schedules` показывает активные и поставленные на паузу расписания.
 - `/autonomy` показывает последние автономные задачи.
 - `/reset` сбрасывает сессию чата (начать новый контекст).
 - `/gc [days]` чистит старые Codex-сессии на диске (по умолчанию 7 дней).
@@ -74,6 +88,7 @@ def _build_bot_commands() -> list[BotCommand]:
         BotCommand(command="pulse", description="Пульс автономности"),
         BotCommand(command="status", description="Статус"),
         BotCommand(command="codexstatus", description="Лимиты Codex CLI"),
+        BotCommand(command="schedules", description="Расписания"),
         BotCommand(command="autonomy", description="Автономность"),
         BotCommand(command="restart", description="Перезапуск"),
     ]
@@ -139,8 +154,10 @@ def _wake_autonomy_now(
     chat_id: int,
     wake_event: asyncio.Event | None = None,
 ) -> None:
+    autonomy_store.clear_guard_block(chat_id)
     autonomy_store.set_autonomy_paused(chat_id, False)
     autonomy_store.clear_idle_snooze(chat_id)
+    autonomy_store.clear_guard_session(chat_id)
     autonomy_store.schedule_next_wakeup_in(chat_id, 0)
     autonomy_store.set_mode(chat_id, "idle")
     if wake_event is not None:
@@ -148,6 +165,8 @@ def _wake_autonomy_now(
 
 
 def _stop_autonomy_now(autonomy_store: AutonomyStore, chat_id: int) -> None:
+    autonomy_store.clear_guard_block(chat_id)
+    autonomy_store.clear_guard_session(chat_id)
     autonomy_store.set_autonomy_paused(chat_id, True)
     autonomy_store.clear_idle_snooze(chat_id)
     autonomy_store.clear_next_wakeup(chat_id)
@@ -470,6 +489,114 @@ def _format_owner_moment(value: str) -> str:
     return msk_dt.strftime("%d.%m %H:%M MSK")
 
 
+def _is_schedule_confirmation(text: str) -> bool:
+    clean = (text or "").strip().lower()
+    return clean in {"да", "ага", "ок", "окей", "подтверждаю", "confirm", "yes", "y"}
+
+
+def _is_schedule_cancel(text: str) -> bool:
+    clean = (text or "").strip().lower()
+    return clean in {"нет", "отмена", "cancel", "no", "n"}
+
+
+def _normalize_schedule_prompt(prompt_text: str, delivery_hint: str) -> str:
+    base = prompt_text.strip()
+    if delivery_hint == "html":
+        suffix = (
+            "Итог оформи как HTML в `html_responses/last-response.html`, "
+            "перезапиши файл и отправь его через `[[send-file:html_responses/last-response.html]]`."
+        )
+        return f"{base}\n\n{suffix}".strip()
+    if delivery_hint == "md":
+        suffix = (
+            "Итог оформи как Markdown в `html_responses/last-response.md`, "
+            "перезапиши файл и отправь его через `[[send-file:html_responses/last-response.md]]`."
+        )
+        return f"{base}\n\n{suffix}".strip()
+    return base
+
+
+def _schedule_preview_text(payload: dict[str, object]) -> str:
+    recurrence_kind = str(payload.get("recurrence_kind") or "")
+    recurrence_json = payload.get("recurrence_json")
+    if not isinstance(recurrence_json, dict):
+        recurrence_json = {}
+    timezone_name = str(payload.get("timezone") or DEFAULT_TIMEZONE)
+    next_run_at = str(payload.get("next_run_at") or "")
+    delivery_hint = str(payload.get("delivery_hint") or "plain")
+    title = str(payload.get("title") or "(без названия)")
+    prompt_text = str(payload.get("prompt_text") or "")
+    action = str(payload.get("action") or "create")
+    action_label = "обновление" if action == "update" else "создание"
+    return (
+        f"Предпросмотр расписания ({action_label}):\n"
+        f"- title: {title}\n"
+        f"- recurrence: {describe_recurrence(recurrence_kind, recurrence_json, timezone_name=timezone_name)}\n"
+        f"- next run: {_format_owner_moment(next_run_at)}\n"
+        f"- delivery: {delivery_hint}\n"
+        f"- prompt: {prompt_text}\n\n"
+        "Ответь `да` чтобы сохранить, или `отмена` чтобы отменить."
+    )
+
+
+def _render_schedules_list(autonomy_store: AutonomyStore, chat_id: int) -> str:
+    schedules = autonomy_store.list_schedules(chat_id=chat_id, include_inactive=True)
+    if not schedules:
+        return "Расписаний пока нет."
+    lines = ["Расписания:"]
+    for schedule in schedules:
+        status = "active" if schedule.active else "paused"
+        if schedule.last_status:
+            status = f"{status}, {schedule.last_status}"
+        lines.append(
+            f"- #{schedule.id} {schedule.title}\n"
+            f"  {describe_recurrence(schedule.recurrence_kind, schedule.recurrence_json, timezone_name=schedule.timezone)}\n"
+            f"  next: {_format_owner_moment(schedule.next_run_at) if schedule.next_run_at else '(не задан)'}\n"
+            f"  status: {status}"
+        )
+    return "\n".join(lines)
+
+
+def _parse_schedule_command_id(text: str) -> int | None:
+    parts = (text or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[1].strip())
+    except ValueError:
+        return None
+
+
+def _maybe_align_wakeup_with_schedules(
+    autonomy_store: AutonomyStore,
+    chat_id: int,
+    wake_event: asyncio.Event | None = None,
+) -> None:
+    schedule_next = autonomy_store.get_next_schedule_run(chat_id)
+    current_next = autonomy_store.get_next_wakeup(chat_id)
+    if schedule_next:
+        target = schedule_next
+        if current_next:
+            current_dt = _parse_iso_dt(current_next)
+            schedule_dt = _parse_iso_dt(schedule_next)
+            if current_dt is not None and schedule_dt is not None and current_dt <= schedule_dt:
+                target = current_next
+        autonomy_store.set_next_wakeup(chat_id, target)
+    if wake_event is not None:
+        wake_event.set()
+
+
+def _arm_autonomy_for_schedule(
+    autonomy_store: AutonomyStore,
+    chat_id: int,
+    wake_event: asyncio.Event | None = None,
+) -> None:
+    autonomy_store.set_autonomy_paused(chat_id, False)
+    autonomy_store.clear_idle_snooze(chat_id)
+    autonomy_store.set_mode(chat_id, "idle")
+    _maybe_align_wakeup_with_schedules(autonomy_store, chat_id, wake_event)
+
+
 def _render_autonomy_status(
     autonomy_store: AutonomyStore,
     chat_id: int,
@@ -485,6 +612,16 @@ def _render_autonomy_status(
     active_phase = autonomy_store.get_active_mission(chat_id)
     mission = autonomy_store.get_live_mission(chat_id)
     notify_last_sent = autonomy_store.get_notify_last_sent(chat_id) or "(не было)"
+    guard_waiting = autonomy_store.guard_waiting_approval(chat_id)
+    guard_reason = autonomy_store.get_guard_block_reason(chat_id)
+    guard_started = _parse_iso_dt(autonomy_store.get_guard_session_started_at(chat_id))
+    guard_runtime_min = 0
+    if guard_started is not None:
+        guard_runtime_min = max(
+            0,
+            int((datetime.now(timezone.utc) - guard_started).total_seconds() // 60),
+        )
+    guard_calls = len(autonomy_store.get_guard_recent_call_timestamps(chat_id))
     lines = [
         "Автономность:",
         f"- pending: {counts['pending']}",
@@ -499,6 +636,17 @@ def _render_autonomy_status(
         f"- next heartbeat: {_format_eta_from_heartbeat(heartbeat_at, heartbeat_sec)}",
         f"- last notify: {notify_last_sent}",
     ]
+    if guard_waiting:
+        lines.append("- guard: waiting_owner_approval")
+        lines.append(f"- guard reason: {guard_reason or '(неизвестно)'}")
+        lines.append(f"- guard runtime: {guard_runtime_min} min")
+        lines.append(f"- guard calls/hour: {guard_calls}")
+    if mode == "sleeping_completed" and next_wakeup != "(не задан)":
+        lines.append("- sleep reason: миссия завершена, контур спит до следующей проверки")
+    elif mode == "sleeping_empty_idle" and next_wakeup != "(не задан)":
+        lines.append("- sleep reason: активных задач нет, контур спит")
+    elif mode == "sleeping_user_declined" and next_wakeup != "(не задан)":
+        lines.append("- sleep reason: владелец отказался от idle-инициативы, контур спит")
     if mission is not None:
         lines.append(f"- root mission: {mission.root_objective}")
         lines.append(f"- mission status: {mission.status}")
@@ -538,6 +686,7 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
     counts = autonomy_store.counts_for_chat(chat_id)
     mode = autonomy_store.get_mode(chat_id) or "(не задан)"
     stopped = autonomy_store.autonomy_paused(chat_id)
+    guard_waiting = autonomy_store.guard_waiting_approval(chat_id)
     next_wakeup_raw = autonomy_store.get_next_wakeup(chat_id) or "(не задан)"
     idle_snooze_raw = autonomy_store.get_idle_snooze_until(chat_id) or ""
     active_phase = autonomy_store.get_active_mission(chat_id)
@@ -587,8 +736,28 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
     else:
         lines.append("- текущая линия: (нет активной миссии)")
 
-    if stopped:
+    if guard_waiting:
+        guard_reason = autonomy_store.get_guard_block_reason(chat_id) or "неизвестно"
+        session_started = _parse_iso_dt(autonomy_store.get_guard_session_started_at(chat_id))
+        runtime_min = 0
+        if session_started is not None:
+            runtime_min = max(
+                0,
+                int((datetime.now(timezone.utc) - session_started).total_seconds() // 60),
+            )
+        lines.append(f"- статус: guard остановил автономность, ждёт подтверждения владельца")
+        lines.append(f"- причина guard: {guard_reason}")
+        lines.append(
+            f"- guard: {len(autonomy_store.get_guard_recent_call_timestamps(chat_id))} автономных вызова за окно, {runtime_min} мин непрерывной работы"
+        )
+    elif stopped:
         lines.append("- статус: автономный контур остановлен")
+    elif mode == "sleeping_completed" and next_wakeup != "(не задан)":
+        lines.append(f"- статус: миссия завершена, спит до {next_wakeup}")
+    elif mode == "sleeping_empty_idle" and next_wakeup != "(не задан)":
+        lines.append(f"- статус: активных задач нет, спит до {next_wakeup}")
+    elif mode == "sleeping_user_declined" and next_wakeup != "(не задан)":
+        lines.append(f"- статус: владелец отказался от idle-инициативы, спит до {next_wakeup}")
     elif mode == "sleeping_idle" and idle_snooze:
         lines.append(f"- статус: притушен до {idle_snooze}")
     elif active_phase is not None and active_phase.phase == "waiting_user":
@@ -605,10 +774,18 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
         lines.append("- статус: последняя миссия уже закрыта")
     else:
         lines.append("- статус: явного автономного хвоста сейчас нет")
-    if active_phase is not None and active_phase.phase == "scheduled":
+    if guard_waiting:
+        lines.append("- причина следующего wake-up: ждёт твоего разрешения продолжить")
+    elif active_phase is not None and active_phase.phase == "scheduled":
         lines.append("- причина следующего wake-up: запланированное продолжение текущей линии")
     elif mission is not None and mission.status == "blocked_user":
         lines.append("- причина следующего wake-up: ожидание ответа владельца")
+    elif mode == "sleeping_completed":
+        lines.append("- причина следующего wake-up: контрольная проверка после завершения миссии")
+    elif mode == "sleeping_empty_idle":
+        lines.append("- причина следующего wake-up: редкая idle-проверка без активных задач")
+    elif mode == "sleeping_user_declined":
+        lines.append("- причина следующего wake-up: длинная пауза после отказа владельца")
     elif counts["running"] > 0:
         lines.append("- причина следующего wake-up: текущий этап ещё выполняется")
     elif counts["pending"] > 0:
@@ -616,7 +793,9 @@ def _render_autonomy_pulse(autonomy_store: AutonomyStore, chat_id: int) -> str:
     elif not stopped:
         lines.append("- причина следующего wake-up: обычный idle heartbeat")
     return "\n".join(lines)
-def _build_pulse_keyboard(*, stopped: bool = False) -> InlineKeyboardMarkup:
+
+
+def _build_pulse_keyboard(*, stopped: bool = False, guard_waiting: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -625,6 +804,9 @@ def _build_pulse_keyboard(*, stopped: bool = False) -> InlineKeyboardMarkup:
             )
         ],
     ]
+    if guard_waiting:
+        rows.extend(build_guard_keyboard().inline_keyboard)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
     if stopped:
         rows.append(
             [
@@ -692,6 +874,7 @@ def _build_dispatcher(
     store: QueueStore,
     autonomy_store: AutonomyStore,
     bot: Bot,
+    runner: CodexRunner,
     stt_client: OpenRouterSttClient,
     autonomy_wake_event: asyncio.Event | None = None,
 ) -> Dispatcher:
@@ -790,6 +973,55 @@ def _build_dispatcher(
         LOGGER.warning("Unauthorized access attempt: chat=%s user=%s", chat_id, user_id)
         return False
 
+    def _save_schedule_payload(chat_id: int, payload: dict[str, object]) -> tuple[int | None, str]:
+        recurrence_json = payload.get("recurrence_json")
+        if not isinstance(recurrence_json, dict):
+            recurrence_json = {}
+        normalized_prompt = _normalize_schedule_prompt(
+            str(payload.get("prompt_text") or ""),
+            str(payload.get("delivery_hint") or "plain"),
+        )
+        action = str(payload.get("action") or "create")
+        if action == "update":
+            schedule_id = int(payload.get("schedule_id") or 0)
+            if schedule_id <= 0:
+                return None, "Не удалось обновить расписание: отсутствует id."
+            schedule = autonomy_store.get_schedule(schedule_id, chat_id=chat_id)
+            if schedule is None:
+                return None, f"Расписание #{schedule_id} не найдено."
+            autonomy_store.update_schedule(
+                schedule_id,
+                title=str(payload.get("title") or schedule.title),
+                prompt_text=normalized_prompt,
+                timezone=str(payload.get("timezone") or schedule.timezone),
+                recurrence_kind=str(payload.get("recurrence_kind") or schedule.recurrence_kind),
+                recurrence_json=recurrence_json or schedule.recurrence_json,
+                next_run_at=str(payload.get("next_run_at") or schedule.next_run_at),
+                delivery_hint=str(payload.get("delivery_hint") or schedule.delivery_hint),
+                active=True,
+                last_status="scheduled",
+            )
+            return schedule_id, f"Расписание #{schedule_id} обновлено."
+        schedule_id = autonomy_store.create_schedule(
+            chat_id=chat_id,
+            title=str(payload.get("title") or "Scheduled job"),
+            prompt_text=normalized_prompt,
+            timezone=str(payload.get("timezone") or DEFAULT_TIMEZONE),
+            recurrence_kind=str(payload.get("recurrence_kind") or ""),
+            recurrence_json=recurrence_json,
+            next_run_at=str(payload.get("next_run_at") or ""),
+            delivery_hint=str(payload.get("delivery_hint") or "plain"),
+            active=True,
+        )
+        return schedule_id, f"Расписание #{schedule_id} сохранено."
+
+    async def _classify_schedule_intent(text: str) -> ScheduleIntent:
+        prompt = build_schedule_intent_prompt(text)
+        result = await asyncio.to_thread(runner.run, prompt, "")
+        if not result.success:
+            return ScheduleIntent(action="no_schedule_intent")
+        return parse_schedule_intent_response(result.message)
+
     @dp.message(Command("start"))
     async def on_start(message: Message) -> None:
         if not await _guard(message):
@@ -840,6 +1072,70 @@ def _build_dispatcher(
             )
         )
 
+    @dp.message(Command("schedules"))
+    async def on_schedules(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        await message.answer(_render_schedules_list(autonomy_store, int(message.chat.id)))
+
+    @dp.message(Command("schedule_pause"))
+    async def on_schedule_pause(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        chat_id = int(message.chat.id)
+        schedule_id = _parse_schedule_command_id(message.text or "")
+        if schedule_id is None:
+            await message.answer("Использование: /schedule_pause <id>")
+            return
+        if not autonomy_store.pause_schedule(schedule_id, chat_id=chat_id):
+            await message.answer(f"Расписание #{schedule_id} не найдено.")
+            return
+        _maybe_align_wakeup_with_schedules(autonomy_store, chat_id, autonomy_wake_event)
+        await message.answer(f"Расписание #{schedule_id} поставлено на паузу.")
+
+    @dp.message(Command("schedule_resume"))
+    async def on_schedule_resume(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        chat_id = int(message.chat.id)
+        schedule_id = _parse_schedule_command_id(message.text or "")
+        if schedule_id is None:
+            await message.answer("Использование: /schedule_resume <id>")
+            return
+        schedule = autonomy_store.get_schedule(schedule_id, chat_id=chat_id)
+        if schedule is None:
+            await message.answer(f"Расписание #{schedule_id} не найдено.")
+            return
+        next_run_at = compute_next_run_at(
+            schedule.recurrence_kind,
+            schedule.recurrence_json,
+            schedule.timezone,
+        )
+        autonomy_store.resume_schedule(schedule_id, chat_id=chat_id, next_run_at=next_run_at)
+        _arm_autonomy_for_schedule(autonomy_store, chat_id, autonomy_wake_event)
+        await message.answer(
+            f"Расписание #{schedule_id} возобновлено. Следующий запуск: {_format_owner_moment(next_run_at)}."
+        )
+
+    @dp.message(Command("schedule_delete"))
+    async def on_schedule_delete(message: Message) -> None:
+        if not await _guard(message):
+            return
+        _note_chat_activity_from_message(store, message)
+        chat_id = int(message.chat.id)
+        schedule_id = _parse_schedule_command_id(message.text or "")
+        if schedule_id is None:
+            await message.answer("Использование: /schedule_delete <id>")
+            return
+        if not autonomy_store.delete_schedule(schedule_id, chat_id=chat_id):
+            await message.answer(f"Расписание #{schedule_id} не найдено.")
+            return
+        _maybe_align_wakeup_with_schedules(autonomy_store, chat_id, autonomy_wake_event)
+        await message.answer(f"Расписание #{schedule_id} удалено.")
+
     @dp.message(Command("pulse"))
     async def on_pulse(message: Message) -> None:
         if not await _guard(message):
@@ -849,7 +1145,8 @@ def _build_dispatcher(
         await message.answer(
             _render_autonomy_pulse(autonomy_store, int(message.chat.id)),
             reply_markup=_build_pulse_keyboard(
-                stopped=autonomy_store.autonomy_paused(int(message.chat.id))
+                stopped=autonomy_store.autonomy_paused(int(message.chat.id)),
+                guard_waiting=autonomy_store.guard_waiting_approval(int(message.chat.id)),
             ),
         )
 
@@ -873,7 +1170,8 @@ def _build_dispatcher(
             await message.edit_text(
                 text,
                 reply_markup=_build_pulse_keyboard(
-                    stopped=autonomy_store.autonomy_paused(chat_id)
+                    stopped=autonomy_store.autonomy_paused(chat_id),
+                    guard_waiting=autonomy_store.guard_waiting_approval(chat_id),
                 ),
             )
         await callback.answer("Пульс обновлён")
@@ -899,7 +1197,8 @@ def _build_dispatcher(
             await message.edit_text(
                 text,
                 reply_markup=_build_pulse_keyboard(
-                    stopped=autonomy_store.autonomy_paused(chat_id)
+                    stopped=autonomy_store.autonomy_paused(chat_id),
+                    guard_waiting=autonomy_store.guard_waiting_approval(chat_id),
                 ),
             )
         await callback.answer("Автономность притушена на 6 часов")
@@ -925,7 +1224,8 @@ def _build_dispatcher(
             await message.edit_text(
                 text,
                 reply_markup=_build_pulse_keyboard(
-                    stopped=autonomy_store.autonomy_paused(chat_id)
+                    stopped=autonomy_store.autonomy_paused(chat_id),
+                    guard_waiting=autonomy_store.guard_waiting_approval(chat_id),
                 ),
             )
         await callback.answer("Автономность разбужена")
@@ -950,7 +1250,10 @@ def _build_dispatcher(
         if current_text != text:
             await message.edit_text(
                 text,
-                reply_markup=_build_pulse_keyboard(stopped=True),
+                reply_markup=_build_pulse_keyboard(
+                    stopped=True,
+                    guard_waiting=autonomy_store.guard_waiting_approval(chat_id),
+                ),
             )
         await callback.answer("Автономность остановлена")
 
@@ -974,9 +1277,69 @@ def _build_dispatcher(
         if current_text != text:
             await message.edit_text(
                 text,
-                reply_markup=_build_pulse_keyboard(stopped=False),
+                reply_markup=_build_pulse_keyboard(
+                    stopped=False,
+                    guard_waiting=autonomy_store.guard_waiting_approval(chat_id),
+                ),
             )
         await callback.answer("Автономность запущена")
+
+    @dp.callback_query(F.data == GUARD_APPROVE_CALLBACK_DATA)
+    async def on_guard_approve_callback(callback: CallbackQuery) -> None:
+        sender = callback.from_user
+        message = callback.message
+        if sender is None or message is None:
+            await callback.answer()
+            return
+        chat_id = int(message.chat.id)
+        user_id = int(sender.id)
+        if not _is_authorized(settings, chat_id, user_id):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+
+        _note_passive_owner_touch(store, message)
+        autonomy_store.set_guard_waiting_approval(chat_id, False)
+        autonomy_store.set_guard_approved_once(chat_id, True)
+        autonomy_store.set_guard_alert_message_id(chat_id, None)
+        autonomy_store.set_mode(chat_id, "idle")
+        autonomy_store.schedule_next_wakeup_in(chat_id, 0)
+        if autonomy_wake_event is not None:
+            autonomy_wake_event.set()
+        text = _render_autonomy_pulse(autonomy_store, chat_id)
+        current_text = (message.text or message.caption or "").strip()
+        if current_text != text:
+            await message.edit_text(
+                text,
+                reply_markup=_build_pulse_keyboard(
+                    stopped=autonomy_store.autonomy_paused(chat_id),
+                    guard_waiting=autonomy_store.guard_waiting_approval(chat_id),
+                ),
+            )
+        await callback.answer("Разрешён один автономный сеанс")
+
+    @dp.callback_query(F.data == GUARD_STOP_CALLBACK_DATA)
+    async def on_guard_stop_callback(callback: CallbackQuery) -> None:
+        sender = callback.from_user
+        message = callback.message
+        if sender is None or message is None:
+            await callback.answer()
+            return
+        chat_id = int(message.chat.id)
+        user_id = int(sender.id)
+        if not _is_authorized(settings, chat_id, user_id):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+
+        _note_passive_owner_touch(store, message)
+        _stop_autonomy_now(autonomy_store, chat_id)
+        text = _render_autonomy_pulse(autonomy_store, chat_id)
+        current_text = (message.text or message.caption or "").strip()
+        if current_text != text:
+            await message.edit_text(
+                text,
+                reply_markup=_build_pulse_keyboard(stopped=True, guard_waiting=False),
+            )
+        await callback.answer("Автономность остановлена")
 
     @dp.message(Command("autonomy"))
     async def on_autonomy(message: Message) -> None:
@@ -1075,6 +1438,94 @@ def _build_dispatcher(
         if not text and not attachments:
             return
 
+        if text and not attachments:
+            pending_schedule = autonomy_store.get_pending_schedule_confirmation(chat_id)
+            if pending_schedule is not None:
+                if _is_schedule_confirmation(text):
+                    autonomy_store.clear_pending_schedule_confirmation(chat_id)
+                    schedule_id, reply = _save_schedule_payload(chat_id, pending_schedule)
+                    if schedule_id is not None:
+                        _arm_autonomy_for_schedule(autonomy_store, chat_id, autonomy_wake_event)
+                    if schedule_id is not None:
+                        await message.answer(reply)
+                    else:
+                        await message.answer(reply)
+                    return
+                if _is_schedule_cancel(text):
+                    autonomy_store.clear_pending_schedule_confirmation(chat_id)
+                    await message.answer("Создание расписания отменено.")
+                    return
+                await message.answer(
+                    "Есть неподтверждённое расписание. Ответь `да` чтобы сохранить его или `отмена` чтобы сбросить.",
+                )
+                return
+
+            intent = await _classify_schedule_intent(text)
+            if intent.action == "list":
+                await message.answer(_render_schedules_list(autonomy_store, chat_id))
+                return
+            if intent.action in {"pause", "resume", "delete"} and intent.schedule_id is not None:
+                if intent.action == "pause":
+                    if autonomy_store.pause_schedule(intent.schedule_id, chat_id=chat_id):
+                        _maybe_align_wakeup_with_schedules(autonomy_store, chat_id, autonomy_wake_event)
+                        await message.answer(f"Расписание #{intent.schedule_id} поставлено на паузу.")
+                    else:
+                        await message.answer(f"Расписание #{intent.schedule_id} не найдено.")
+                    return
+                if intent.action == "resume":
+                    schedule = autonomy_store.get_schedule(intent.schedule_id, chat_id=chat_id)
+                    if schedule is None:
+                        await message.answer(f"Расписание #{intent.schedule_id} не найдено.")
+                        return
+                    next_run_at = compute_next_run_at(
+                        schedule.recurrence_kind,
+                        schedule.recurrence_json,
+                        schedule.timezone,
+                    )
+                    autonomy_store.resume_schedule(intent.schedule_id, chat_id=chat_id, next_run_at=next_run_at)
+                    _arm_autonomy_for_schedule(autonomy_store, chat_id, autonomy_wake_event)
+                    await message.answer(
+                        f"Расписание #{intent.schedule_id} возобновлено. Следующий запуск: {_format_owner_moment(next_run_at)}."
+                    )
+                    return
+                if intent.action == "delete":
+                    if autonomy_store.delete_schedule(intent.schedule_id, chat_id=chat_id):
+                        _maybe_align_wakeup_with_schedules(autonomy_store, chat_id, autonomy_wake_event)
+                        await message.answer(f"Расписание #{intent.schedule_id} удалено.")
+                    else:
+                        await message.answer(f"Расписание #{intent.schedule_id} не найдено.")
+                    return
+
+            if intent.action in {"create", "update"}:
+                try:
+                    next_run_at = compute_next_run_at(
+                        intent.recurrence_kind,
+                        intent.recurrence_json or {},
+                        intent.timezone,
+                    )
+                except Exception:
+                    await message.answer("Не удалось разобрать расписание. Проверь дату/время и попробуй ещё раз.")
+                    return
+                preview_payload = {
+                    "action": intent.action,
+                    "schedule_id": intent.schedule_id,
+                    "title": intent.title,
+                    "prompt_text": intent.prompt_text,
+                    "recurrence_kind": intent.recurrence_kind,
+                    "recurrence_json": intent.recurrence_json or {},
+                    "timezone": intent.timezone,
+                    "delivery_hint": intent.delivery_hint,
+                    "next_run_at": next_run_at,
+                }
+                if intent.action == "update":
+                    existing = autonomy_store.get_schedule(int(intent.schedule_id or 0), chat_id=chat_id)
+                    if existing is None:
+                        await message.answer(f"Расписание #{intent.schedule_id} не найдено.")
+                        return
+                autonomy_store.set_pending_schedule_confirmation(chat_id, preview_payload)
+                await message.answer(_schedule_preview_text(preview_payload))
+                return
+
         task_id = store.enqueue_task(
             chat_id=chat_id,
             user_id=user_id,
@@ -1129,6 +1580,13 @@ async def _run_async() -> None:
     if observed_restart:
         LOGGER.info("Observed completed restart for %s", BOT_SERVICE_NAME)
     autonomy_wake_event = asyncio.Event()
+    last_active_chat_id = store.get_last_active_chat_id()
+    if last_active_chat_id is not None:
+        _maybe_align_wakeup_with_schedules(
+            autonomy_store,
+            last_active_chat_id,
+            autonomy_wake_event,
+        )
     worker = Worker(
         settings=settings,
         store=store,
@@ -1156,6 +1614,7 @@ async def _run_async() -> None:
         store,
         autonomy_store,
         bot,
+        runner,
         stt_client,
         autonomy_wake_event,
     )

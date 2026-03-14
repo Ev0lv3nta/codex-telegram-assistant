@@ -39,6 +39,7 @@ class AutonomyTask:
     result_text: str
     error_text: str
     continuation_count: int = 0
+    schedule_id: int | None = None
 
 
 @dataclass
@@ -60,6 +61,26 @@ class AutonomyMission:
     plan_updated_at: str | None
     last_checkpoint_summary: str
     last_self_check_summary: str
+
+
+@dataclass
+class AutonomySchedule:
+    id: int
+    chat_id: int
+    title: str
+    prompt_text: str
+    timezone: str
+    recurrence_kind: str
+    recurrence_json: dict[str, object]
+    next_run_at: str
+    last_enqueued_at: str | None
+    last_started_at: str | None
+    last_finished_at: str | None
+    last_status: str
+    delivery_hint: str
+    active: bool
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -92,6 +113,7 @@ class AutonomyStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL DEFAULT 0,
                     mission_id INTEGER,
+                    schedule_id INTEGER,
                     kind TEXT NOT NULL,
                     title TEXT NOT NULL,
                     details TEXT NOT NULL,
@@ -121,6 +143,10 @@ class AutonomyStore:
             if "mission_id" not in columns:
                 self._conn.execute(
                     "ALTER TABLE autonomy_tasks ADD COLUMN mission_id INTEGER"
+                )
+            if "schedule_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_tasks ADD COLUMN schedule_id INTEGER"
                 )
             if "parent_task_id" not in columns:
                 self._conn.execute(
@@ -207,6 +233,48 @@ class AutonomyStore:
                 ON autonomy_tasks(mission_id, id DESC)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_autonomy_tasks_schedule
+                ON autonomy_tasks(schedule_id, status, scheduled_for, id)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autonomy_schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL DEFAULT 0,
+                    title TEXT NOT NULL,
+                    prompt_text TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+                    recurrence_kind TEXT NOT NULL,
+                    recurrence_json TEXT NOT NULL DEFAULT '{}',
+                    next_run_at TEXT,
+                    last_enqueued_at TEXT,
+                    last_started_at TEXT,
+                    last_finished_at TEXT,
+                    last_status TEXT NOT NULL DEFAULT '',
+                    delivery_hint TEXT NOT NULL DEFAULT 'plain',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            schedule_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(autonomy_schedules)").fetchall()
+            }
+            if "delivery_hint" not in schedule_columns:
+                self._conn.execute(
+                    "ALTER TABLE autonomy_schedules ADD COLUMN delivery_hint TEXT NOT NULL DEFAULT 'plain'"
+                )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_autonomy_schedules_chat_active_next
+                ON autonomy_schedules(chat_id, active, next_run_at, id)
+                """
+            )
 
     def enqueue_task(
         self,
@@ -215,6 +283,7 @@ class AutonomyStore:
         *,
         chat_id: int = 0,
         mission_id: int | None = None,
+        schedule_id: int | None = None,
         kind: str = "general",
         priority: int = 100,
         scheduled_for: str | None = None,
@@ -228,6 +297,7 @@ class AutonomyStore:
                 INSERT INTO autonomy_tasks (
                     chat_id,
                     mission_id,
+                    schedule_id,
                     kind,
                     title,
                     details,
@@ -237,11 +307,12 @@ class AutonomyStore:
                     source,
                     created_at,
                     scheduled_for
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
                     mission_id,
+                    schedule_id,
                     kind,
                     title,
                     details,
@@ -719,6 +790,281 @@ class AutonomyStore:
             result[str(row["status"])] = int(row["cnt"])
         return result
 
+    def has_active_task_for_schedule(self, chat_id: int, schedule_id: int) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM autonomy_tasks
+            WHERE chat_id = ?
+              AND schedule_id = ?
+              AND status IN ('pending', 'running', 'waiting_user')
+            LIMIT 1
+            """,
+            (chat_id, schedule_id),
+        ).fetchone()
+        return row is not None
+
+    def create_schedule(
+        self,
+        *,
+        chat_id: int,
+        title: str,
+        prompt_text: str,
+        timezone: str,
+        recurrence_kind: str,
+        recurrence_json: dict[str, object],
+        next_run_at: str,
+        delivery_hint: str = "plain",
+        active: bool = True,
+    ) -> int:
+        now = _utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO autonomy_schedules (
+                    chat_id,
+                    title,
+                    prompt_text,
+                    timezone,
+                    recurrence_kind,
+                    recurrence_json,
+                    next_run_at,
+                    last_status,
+                    delivery_hint,
+                    active,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    title.strip(),
+                    prompt_text.strip(),
+                    timezone.strip() or "Europe/Moscow",
+                    recurrence_kind.strip(),
+                    json.dumps(recurrence_json, ensure_ascii=False),
+                    next_run_at.strip(),
+                    "scheduled",
+                    delivery_hint.strip() or "plain",
+                    1 if active else 0,
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_schedule(self, schedule_id: int, *, chat_id: int | None = None) -> AutonomySchedule | None:
+        params: list[object] = [schedule_id]
+        chat_sql = ""
+        if chat_id is not None:
+            chat_sql = "AND chat_id = ?"
+            params.append(chat_id)
+        row = self._conn.execute(
+            f"""
+            SELECT *
+            FROM autonomy_schedules
+            WHERE id = ?
+              {chat_sql}
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_schedule(row)
+
+    def list_schedules(
+        self,
+        *,
+        chat_id: int,
+        include_inactive: bool = True,
+        limit: int = 100,
+    ) -> list[AutonomySchedule]:
+        where = "WHERE chat_id = ?"
+        params: list[object] = [chat_id]
+        if not include_inactive:
+            where += " AND active = 1"
+        params.append(max(1, int(limit)))
+        rows = self._conn.execute(
+            f"""
+            SELECT *
+            FROM autonomy_schedules
+            {where}
+            ORDER BY active DESC, next_run_at IS NULL, next_run_at ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._row_to_schedule(row) for row in rows]
+
+    def list_due_schedules(
+        self,
+        *,
+        chat_id: int,
+        now: str | None = None,
+    ) -> list[AutonomySchedule]:
+        effective_now = now or _utc_now()
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM autonomy_schedules
+            WHERE chat_id = ?
+              AND active = 1
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= ?
+            ORDER BY next_run_at ASC, id ASC
+            """,
+            (chat_id, effective_now),
+        ).fetchall()
+        return [self._row_to_schedule(row) for row in rows]
+
+    def get_next_schedule_run(self, chat_id: int) -> str:
+        row = self._conn.execute(
+            """
+            SELECT next_run_at
+            FROM autonomy_schedules
+            WHERE chat_id = ?
+              AND active = 1
+              AND next_run_at IS NOT NULL
+            ORDER BY next_run_at ASC, id ASC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        return str(row["next_run_at"] or "")
+
+    def update_schedule(
+        self,
+        schedule_id: int,
+        *,
+        title: str | None = None,
+        prompt_text: str | None = None,
+        timezone: str | None = None,
+        recurrence_kind: str | None = None,
+        recurrence_json: dict[str, object] | None = None,
+        next_run_at: str | None = None,
+        last_enqueued_at: str | None = None,
+        last_started_at: str | None = None,
+        last_finished_at: str | None = None,
+        last_status: str | None = None,
+        delivery_hint: str | None = None,
+        active: bool | None = None,
+    ) -> None:
+        assignments = ["updated_at = ?"]
+        params: list[object] = [_utc_now()]
+        if title is not None:
+            assignments.append("title = ?")
+            params.append(title.strip())
+        if prompt_text is not None:
+            assignments.append("prompt_text = ?")
+            params.append(prompt_text.strip())
+        if timezone is not None:
+            assignments.append("timezone = ?")
+            params.append(timezone.strip() or "Europe/Moscow")
+        if recurrence_kind is not None:
+            assignments.append("recurrence_kind = ?")
+            params.append(recurrence_kind.strip())
+        if recurrence_json is not None:
+            assignments.append("recurrence_json = ?")
+            params.append(json.dumps(recurrence_json, ensure_ascii=False))
+        if next_run_at is not None:
+            assignments.append("next_run_at = ?")
+            params.append(next_run_at.strip())
+        if last_enqueued_at is not None:
+            assignments.append("last_enqueued_at = ?")
+            params.append(last_enqueued_at)
+        if last_started_at is not None:
+            assignments.append("last_started_at = ?")
+            params.append(last_started_at)
+        if last_finished_at is not None:
+            assignments.append("last_finished_at = ?")
+            params.append(last_finished_at)
+        if last_status is not None:
+            assignments.append("last_status = ?")
+            params.append(last_status.strip())
+        if delivery_hint is not None:
+            assignments.append("delivery_hint = ?")
+            params.append(delivery_hint.strip() or "plain")
+        if active is not None:
+            assignments.append("active = ?")
+            params.append(1 if active else 0)
+        params.append(schedule_id)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"""
+                UPDATE autonomy_schedules
+                SET {", ".join(assignments)}
+                WHERE id = ?
+                """,
+                params,
+            )
+
+    def pause_schedule(self, schedule_id: int, *, chat_id: int) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE autonomy_schedules
+                SET active = 0,
+                    updated_at = ?,
+                    last_status = 'paused'
+                WHERE id = ?
+                  AND chat_id = ?
+                """,
+                (_utc_now(), schedule_id, chat_id),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    def resume_schedule(self, schedule_id: int, *, chat_id: int, next_run_at: str) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE autonomy_schedules
+                SET active = 1,
+                    next_run_at = ?,
+                    updated_at = ?,
+                    last_status = 'scheduled'
+                WHERE id = ?
+                  AND chat_id = ?
+                """,
+                (next_run_at, _utc_now(), schedule_id, chat_id),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    def delete_schedule(self, schedule_id: int, *, chat_id: int) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM autonomy_schedules
+                WHERE id = ?
+                  AND chat_id = ?
+                """,
+                (schedule_id, chat_id),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    def set_pending_schedule_confirmation(self, chat_id: int, payload: dict[str, object]) -> None:
+        self.set_meta(
+            f"schedule:pending_confirmation:{chat_id}",
+            json.dumps(payload, ensure_ascii=False),
+        )
+
+    def get_pending_schedule_confirmation(self, chat_id: int) -> dict[str, object] | None:
+        raw = self.get_meta(f"schedule:pending_confirmation:{chat_id}", "").strip()
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def clear_pending_schedule_confirmation(self, chat_id: int) -> None:
+        self.set_meta(f"schedule:pending_confirmation:{chat_id}", "")
+
     def counts_for_chat(self, chat_id: int) -> dict[str, int]:
         rows = self._conn.execute(
             """
@@ -1037,8 +1383,94 @@ class AutonomyStore:
     def autonomy_paused(self, chat_id: int) -> bool:
         return self.get_meta(f"autonomy:paused:{chat_id}", "0") == "1"
 
+    def set_guard_waiting_approval(self, chat_id: int, waiting: bool) -> None:
+        self.set_meta(f"guard:waiting_approval:{chat_id}", "1" if waiting else "0")
+
+    def guard_waiting_approval(self, chat_id: int) -> bool:
+        return self.get_meta(f"guard:waiting_approval:{chat_id}", "0") == "1"
+
+    def set_guard_approved_once(self, chat_id: int, approved: bool) -> None:
+        self.set_meta(f"guard:approved_once:{chat_id}", "1" if approved else "0")
+
+    def guard_approved_once(self, chat_id: int) -> bool:
+        return self.get_meta(f"guard:approved_once:{chat_id}", "0") == "1"
+
+    def set_guard_block_reason(self, chat_id: int, reason: str) -> None:
+        self.set_meta(f"guard:block_reason:{chat_id}", reason.strip())
+
+    def get_guard_block_reason(self, chat_id: int) -> str:
+        return self.get_meta(f"guard:block_reason:{chat_id}", "")
+
+    def set_guard_blocked_at(self, chat_id: int, at: str) -> None:
+        self.set_meta(f"guard:blocked_at:{chat_id}", at.strip())
+
+    def get_guard_blocked_at(self, chat_id: int) -> str:
+        return self.get_meta(f"guard:blocked_at:{chat_id}", "")
+
+    def set_guard_alert_message_id(self, chat_id: int, message_id: int | None) -> None:
+        self.set_meta(
+            f"guard:alert_message_id:{chat_id}",
+            "" if message_id is None else str(int(message_id)),
+        )
+
+    def get_guard_alert_message_id(self, chat_id: int) -> int | None:
+        raw = self.get_meta(f"guard:alert_message_id:{chat_id}", "")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def set_guard_last_alert_at(self, chat_id: int, at: str) -> None:
+        self.set_meta(f"guard:last_alert_at:{chat_id}", at.strip())
+
+    def get_guard_last_alert_at(self, chat_id: int) -> str:
+        return self.get_meta(f"guard:last_alert_at:{chat_id}", "")
+
+    def set_guard_session_started_at(self, chat_id: int, at: str) -> None:
+        self.set_meta(f"guard:session_started_at:{chat_id}", at.strip())
+
+    def get_guard_session_started_at(self, chat_id: int) -> str:
+        return self.get_meta(f"guard:session_started_at:{chat_id}", "")
+
+    def set_guard_session_last_activity_at(self, chat_id: int, at: str) -> None:
+        self.set_meta(f"guard:session_last_activity_at:{chat_id}", at.strip())
+
+    def get_guard_session_last_activity_at(self, chat_id: int) -> str:
+        return self.get_meta(f"guard:session_last_activity_at:{chat_id}", "")
+
+    def set_guard_recent_call_timestamps(self, chat_id: int, timestamps: list[str]) -> None:
+        self.set_meta(
+            f"guard:recent_codex_call_timestamps:{chat_id}",
+            json.dumps(timestamps, ensure_ascii=False),
+        )
+
+    def get_guard_recent_call_timestamps(self, chat_id: int) -> list[str]:
+        raw = self.get_meta(f"guard:recent_codex_call_timestamps:{chat_id}", "")
+        if not raw.strip():
+            return []
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [str(item) for item in payload if str(item).strip()]
+
+    def clear_guard_session(self, chat_id: int) -> None:
+        self.set_guard_session_started_at(chat_id, "")
+        self.set_guard_session_last_activity_at(chat_id, "")
+
+    def clear_guard_block(self, chat_id: int) -> None:
+        self.set_guard_waiting_approval(chat_id, False)
+        self.set_guard_approved_once(chat_id, False)
+        self.set_guard_block_reason(chat_id, "")
+        self.set_guard_blocked_at(chat_id, "")
+        self.set_guard_alert_message_id(chat_id, None)
+        self.set_guard_last_alert_at(chat_id, "")
+
     @staticmethod
     def _row_to_task(row: sqlite3.Row | dict[str, object]) -> AutonomyTask:
+        schedule_value = row["schedule_id"] if "schedule_id" in row.keys() else None
         return AutonomyTask(
             id=int(row["id"]),
             chat_id=int(row["chat_id"]),
@@ -1060,6 +1492,7 @@ class AutonomyStore:
             result_text=str(row["result_text"] or ""),
             error_text=str(row["error_text"] or ""),
             continuation_count=int(row["continuation_count"] or 0),
+            schedule_id=int(schedule_value) if schedule_value is not None else None,
         )
 
     @staticmethod
@@ -1082,6 +1515,34 @@ class AutonomyStore:
             plan_updated_at=str(row["plan_updated_at"]) if row["plan_updated_at"] else None,
             last_checkpoint_summary=str(row["last_checkpoint_summary"] or ""),
             last_self_check_summary=str(row["last_self_check_summary"] or ""),
+        )
+
+    @staticmethod
+    def _row_to_schedule(row: sqlite3.Row | dict[str, object]) -> AutonomySchedule:
+        recurrence_raw = str(row["recurrence_json"] or "{}")
+        try:
+            recurrence_json = json.loads(recurrence_raw)
+        except json.JSONDecodeError:
+            recurrence_json = {}
+        if not isinstance(recurrence_json, dict):
+            recurrence_json = {}
+        return AutonomySchedule(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            title=str(row["title"] or ""),
+            prompt_text=str(row["prompt_text"] or ""),
+            timezone=str(row["timezone"] or "Europe/Moscow"),
+            recurrence_kind=str(row["recurrence_kind"] or ""),
+            recurrence_json=recurrence_json,
+            next_run_at=str(row["next_run_at"] or ""),
+            last_enqueued_at=str(row["last_enqueued_at"]) if row["last_enqueued_at"] else None,
+            last_started_at=str(row["last_started_at"]) if row["last_started_at"] else None,
+            last_finished_at=str(row["last_finished_at"]) if row["last_finished_at"] else None,
+            last_status=str(row["last_status"] or ""),
+            delivery_hint=str(row["delivery_hint"] or "plain"),
+            active=bool(int(row["active"] or 0)),
+            created_at=str(row["created_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
         )
 
     def close(self) -> None:

@@ -13,6 +13,7 @@ class CodexRunResult:
     success: bool
     message: str
     session_id: str
+    timed_out: bool = False
 
 
 class CodexRunner:
@@ -123,17 +124,23 @@ class CodexRunner:
             "Если нужно, повтори запрос или сбрось контекст командой /reset."
         )
 
-    def run(self, prompt: str, session_id: str = "") -> CodexRunResult:
+    def run(
+        self,
+        prompt: str,
+        session_id: str = "",
+        timeout_sec: int | None = None,
+    ) -> CodexRunResult:
         try:
             if session_id:
                 command = self._build_resume_command(session_id=session_id, prompt=prompt)
             else:
                 command = self._build_exec_command(prompt=prompt)
-            completed = self._run_once(command, self._settings.codex_timeout_sec)
+            effective_timeout = timeout_sec or self._settings.codex_timeout_sec
+            completed = self._run_once(command, effective_timeout)
         except FileNotFoundError:
             return CodexRunResult(False, "Failed to run codex: binary not found", "")
         except subprocess.TimeoutExpired:
-            return CodexRunResult(False, "Codex execution timed out", session_id)
+            return CodexRunResult(False, "Codex execution timed out", session_id, timed_out=True)
 
         parsed_session_id, parsed_message = self._parse_json_output(completed.stdout or "")
         effective_session_id = parsed_session_id or session_id

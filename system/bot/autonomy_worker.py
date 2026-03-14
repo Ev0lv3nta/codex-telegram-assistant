@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from contextlib import suppress
@@ -24,11 +25,14 @@ from .autonomy_planner import (
 )
 from .autonomy_requests import read_active_autonomy_request_summaries
 from .autonomy_store import AutonomyMission, AutonomyStore, AutonomyTask
+from .autonomy_guard import build_guard_keyboard
 from .codex_runner import CodexRunner
 from .config import Settings
 from .delivery import deliver_agent_response, parse_agent_response
 from .prompts import build_autonomy_control_prompt, build_autonomy_wakeup_prompt
+from .prompts import build_prompt
 from .queue_store import QueueStore
+from .schedule_parser import compute_next_run_at
 
 
 class AutonomyWorker:
@@ -182,6 +186,174 @@ class AutonomyWorker:
                 stop_wait.cancel()
             if not wake_wait.done():
                 wake_wait.cancel()
+
+    def _guard_recent_call_times(self, chat_id: int, *, now_dt: datetime | None = None) -> list[datetime]:
+        effective_now = now_dt or datetime.now(timezone.utc)
+        window_sec = max(1, self._settings.autonomy_guard_rolling_window_sec)
+        kept: list[datetime] = []
+        for raw in self._autonomy_store.get_guard_recent_call_timestamps(chat_id):
+            parsed = datetime.fromisoformat(raw) if raw else None
+            if parsed is None:
+                continue
+            if (effective_now - parsed).total_seconds() <= window_sec:
+                kept.append(parsed)
+        self._autonomy_store.set_guard_recent_call_timestamps(
+            chat_id,
+            [item.isoformat() for item in kept],
+        )
+        return kept
+
+    def _guard_stats(self, chat_id: int, *, now_dt: datetime | None = None) -> tuple[int, int]:
+        effective_now = now_dt or datetime.now(timezone.utc)
+        recent_calls = self._guard_recent_call_times(chat_id, now_dt=effective_now)
+        runtime_sec = 0
+        started_raw = self._autonomy_store.get_guard_session_started_at(chat_id)
+        if started_raw:
+            with suppress(ValueError):
+                started_dt = datetime.fromisoformat(started_raw)
+                runtime_sec = max(0, int((effective_now - started_dt).total_seconds()))
+        return runtime_sec, len(recent_calls)
+
+    def _guard_begin_session(self, chat_id: int, *, now_dt: datetime | None = None) -> None:
+        effective_now = now_dt or datetime.now(timezone.utc)
+        now_raw = effective_now.isoformat()
+        if not self._autonomy_store.get_guard_session_started_at(chat_id):
+            self._autonomy_store.set_guard_session_started_at(chat_id, now_raw)
+        self._autonomy_store.set_guard_session_last_activity_at(chat_id, now_raw)
+
+    def _guard_end_session(self, chat_id: int) -> None:
+        self._autonomy_store.clear_guard_session(chat_id)
+
+    def _guard_record_call(self, chat_id: int, *, at_dt: datetime | None = None) -> int:
+        effective_now = at_dt or datetime.now(timezone.utc)
+        recent = self._guard_recent_call_times(chat_id, now_dt=effective_now)
+        recent.append(effective_now)
+        self._autonomy_store.set_guard_recent_call_timestamps(
+            chat_id,
+            [item.isoformat() for item in recent],
+        )
+        self._autonomy_store.set_guard_session_last_activity_at(chat_id, effective_now.isoformat())
+        return len(recent)
+
+    def _consume_guard_approval(self, chat_id: int) -> None:
+        self._autonomy_store.set_guard_approved_once(chat_id, False)
+        self._guard_end_session(chat_id)
+
+    async def _engage_guard(
+        self,
+        chat_id: int,
+        *,
+        reason: str,
+        runtime_sec: int,
+        recent_call_count: int,
+    ) -> None:
+        blocked_at = datetime.now(timezone.utc).isoformat()
+        self._autonomy_store.set_guard_waiting_approval(chat_id, True)
+        self._autonomy_store.set_guard_approved_once(chat_id, False)
+        self._autonomy_store.set_guard_block_reason(chat_id, reason)
+        self._autonomy_store.set_guard_blocked_at(chat_id, blocked_at)
+        self._autonomy_store.set_guard_last_alert_at(chat_id, blocked_at)
+        self._autonomy_store.set_mode(chat_id, "guard_waiting_approval")
+        self._autonomy_store.schedule_next_wakeup_in(
+            chat_id,
+            self._settings.autonomy_idle_sleep_sec,
+        )
+        self._autonomy_store.mark_heartbeat("guard_waiting_approval")
+        if self._autonomy_store.get_guard_alert_message_id(chat_id) is not None:
+            return
+
+        if reason == "too_many_calls":
+            reason_text = (
+                f"Слишком много автономных Codex-вызовов за последний час: {recent_call_count}. "
+                f"Лимит: {self._settings.autonomy_guard_max_codex_calls_per_hour}."
+            )
+        else:
+            minutes = max(1, runtime_sec // 60)
+            reason_text = (
+                f"Автономность работала слишком долго подряд: {minutes} мин. "
+                f"Лимит: {self._settings.autonomy_guard_max_continuous_runtime_sec // 60} мин."
+            )
+        text = (
+            "Guard остановил автономный контур.\n"
+            f"- причина: {reason_text}\n"
+            f"- непрерывная длительность сеанса: {runtime_sec // 60} мин\n"
+            f"- автономных Codex-вызовов за час: {recent_call_count}\n\n"
+            "Дальнейшая автономная работа остановлена до твоего решения."
+        )
+        try:
+            sent = await self._bot.send_message(
+                chat_id,
+                text,
+                reply_markup=build_guard_keyboard(),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self._logger.warning("Failed to send autonomy guard alert: %s", exc)
+            return
+        message_id = getattr(sent, "message_id", None)
+        if isinstance(message_id, int):
+            self._autonomy_store.set_guard_alert_message_id(chat_id, message_id)
+
+    async def _check_guard_before_autonomy_call(self, chat_id: int) -> bool:
+        approved_once = self._autonomy_store.guard_approved_once(chat_id)
+        if self._autonomy_store.guard_waiting_approval(chat_id) and not approved_once:
+            self._autonomy_store.set_mode(chat_id, "guard_waiting_approval")
+            return False
+        now_dt = datetime.now(timezone.utc)
+        runtime_sec, recent_call_count = self._guard_stats(chat_id, now_dt=now_dt)
+        if not approved_once:
+            max_runtime = max(1, self._settings.autonomy_guard_max_continuous_runtime_sec)
+            max_calls = max(1, self._settings.autonomy_guard_max_codex_calls_per_hour)
+            if recent_call_count >= max_calls:
+                await self._engage_guard(
+                    chat_id,
+                    reason="too_many_calls",
+                    runtime_sec=runtime_sec,
+                    recent_call_count=recent_call_count,
+                )
+                return False
+            if runtime_sec >= max_runtime:
+                await self._engage_guard(
+                    chat_id,
+                    reason="continuous_runtime",
+                    runtime_sec=runtime_sec,
+                    recent_call_count=recent_call_count,
+                )
+                return False
+        self._guard_begin_session(chat_id, now_dt=now_dt)
+        return True
+
+    async def _run_autonomy_codex(
+        self,
+        chat_id: int,
+        prompt: str,
+        session_id: str = "",
+    ):
+        if not await self._check_guard_before_autonomy_call(chat_id):
+            return None
+        timeout_sec = self._settings.codex_timeout_sec
+        if self._settings.autonomy_guard_max_continuous_runtime_sec > 0:
+            timeout_sec = min(
+                timeout_sec,
+                self._settings.autonomy_guard_max_continuous_runtime_sec,
+            )
+        result = await asyncio.to_thread(
+            self._runner.run,
+            prompt,
+            session_id,
+            timeout_sec,
+        )
+        finished_dt = datetime.now(timezone.utc)
+        recent_call_count = self._guard_record_call(chat_id, at_dt=finished_dt)
+        runtime_sec, _ = self._guard_stats(chat_id, now_dt=finished_dt)
+        if getattr(result, "timed_out", False):
+            await self._engage_guard(
+                chat_id,
+                reason="continuous_runtime",
+                runtime_sec=runtime_sec,
+                recent_call_count=recent_call_count,
+            )
+            return None
+        return result
 
     def _has_duplicate_waiting_blocker(self, chat_id: int, text: str) -> bool:
         candidate = self._compact_text(text, limit=500)
@@ -346,6 +518,19 @@ class AutonomyWorker:
     @staticmethod
     def _scheduled_after(delay_sec: int) -> str:
         return (datetime.now(timezone.utc) + timedelta(seconds=delay_sec)).isoformat()
+
+    @staticmethod
+    def _earlier_moment(left: str, right: str) -> str:
+        if not left:
+            return right
+        if not right:
+            return left
+        try:
+            left_dt = datetime.fromisoformat(left)
+            right_dt = datetime.fromisoformat(right)
+        except ValueError:
+            return left or right
+        return left if left_dt <= right_dt else right
 
     @staticmethod
     def _default_success_criteria(source: str) -> str:
@@ -723,18 +908,99 @@ class AutonomyWorker:
             blocker_type=blocker_type,
             next_step_justification=next_step_justification,
         )
-        result = await asyncio.to_thread(self._runner.run, prompt, session_id)
+        result = await self._run_autonomy_codex(
+            mission.chat_id,
+            prompt,
+            session_id,
+        )
+        if result is None:
+            return "GUARD_WAITING_APPROVAL", session_id
         verdict = parse_control_decision(result.message or "")
         next_session_id = result.session_id or session_id
         return verdict.verdict, next_session_id
 
     def _schedule_mode(self, chat_id: int, mode: str, *, delay_sec: int | None = None, at: str | None = None) -> None:
         self._autonomy_store.set_mode(chat_id, mode)
+        schedule_next = self._autonomy_store.get_next_schedule_run(chat_id)
         if at:
-            self._autonomy_store.set_next_wakeup(chat_id, at)
+            self._autonomy_store.set_next_wakeup(
+                chat_id,
+                self._earlier_moment(at, schedule_next),
+            )
             return
         if delay_sec is not None:
-            self._autonomy_store.schedule_next_wakeup_in(chat_id, delay_sec)
+            target = self._scheduled_after(delay_sec)
+            self._autonomy_store.set_next_wakeup(
+                chat_id,
+                self._earlier_moment(target, schedule_next),
+            )
+
+    def _next_schedule_run_after_enqueue(self, schedule: object) -> tuple[str, bool]:
+        recurrence_kind = getattr(schedule, "recurrence_kind", "")
+        recurrence_json = getattr(schedule, "recurrence_json", {}) or {}
+        timezone_name = getattr(schedule, "timezone", "") or "Europe/Moscow"
+        if recurrence_kind == "once":
+            return "", False
+        return compute_next_run_at(
+            recurrence_kind,
+            recurrence_json,
+            timezone_name,
+        ), True
+
+    def _materialize_due_schedules(self, chat_id: int) -> int:
+        due_schedules = self._autonomy_store.list_due_schedules(chat_id=chat_id)
+        if not due_schedules:
+            return 0
+        created = 0
+        for schedule in due_schedules:
+            next_run_at, keep_active = self._next_schedule_run_after_enqueue(schedule)
+            if self._autonomy_store.has_active_task_for_schedule(chat_id, schedule.id):
+                self._autonomy_store.update_schedule(
+                    schedule.id,
+                    next_run_at=next_run_at,
+                    active=keep_active,
+                    last_status="skipped_overlap",
+                )
+                continue
+            task_id = self._autonomy_store.enqueue_task(
+                chat_id=chat_id,
+                schedule_id=schedule.id,
+                title=schedule.title,
+                details=schedule.prompt_text,
+                kind="scheduled",
+                priority=40,
+                source="scheduled",
+            )
+            created += 1
+            self._autonomy_store.update_schedule(
+                schedule.id,
+                next_run_at=next_run_at,
+                last_enqueued_at=datetime.now(timezone.utc).isoformat(),
+                last_status=f"enqueued#{task_id}",
+                active=keep_active,
+            )
+        return created
+
+    def _schedule_sleeping_completed(self, chat_id: int) -> None:
+        self._guard_end_session(chat_id)
+        self._autonomy_store.clear_idle_snooze(chat_id)
+        self._schedule_mode(
+            chat_id,
+            "sleeping_completed",
+            delay_sec=self._settings.autonomy_post_complete_sleep_sec,
+        )
+
+    def _schedule_sleeping_empty_idle(self, chat_id: int) -> None:
+        self._guard_end_session(chat_id)
+        until = self._scheduled_after(self._settings.autonomy_empty_idle_sleep_sec)
+        self._autonomy_store.mark_idle_snooze_until(chat_id, until)
+        self._schedule_mode(chat_id, "sleeping_empty_idle", at=until)
+
+    def _schedule_sleeping_user_declined(self, chat_id: int) -> None:
+        self._guard_end_session(chat_id)
+        until = self._scheduled_after(self._settings.autonomy_idle_sleep_sec)
+        self._autonomy_store.mark_idle_snooze_until(chat_id, until)
+        self._schedule_mode(chat_id, "sleeping_user_declined", at=until)
 
     @staticmethod
     def _compose_stored_result(
@@ -803,11 +1069,24 @@ class AutonomyWorker:
         if self._autonomy_store.autonomy_paused(chat_id):
             self._autonomy_store.set_mode(chat_id, "stopped")
             return
+        if (
+            self._autonomy_store.guard_waiting_approval(chat_id)
+            and not self._autonomy_store.guard_approved_once(chat_id)
+        ):
+            self._autonomy_store.set_mode(chat_id, "guard_waiting_approval")
+            return
         current_signal = self._queue_store.get_user_signal(chat_id)
         force_wakeup = current_signal > self._autonomy_store.get_last_seen_user_signal(chat_id)
         if not self._autonomy_store.wakeup_due(chat_id) and not force_wakeup:
             return
         self._autonomy_store.mark_heartbeat("loop")
+        materialized_count = self._materialize_due_schedules(chat_id)
+        if materialized_count:
+            self._logger.info(
+                "Materialized %s due schedule task(s) for chat=%s",
+                materialized_count,
+                chat_id,
+            )
 
         if self._queue_store.pending_user_tasks(chat_id) > 0:
             self._schedule_mode(
@@ -894,6 +1173,15 @@ class AutonomyWorker:
                     self._schedule_mode(chat_id, "sleeping_scheduled", at=next_pending_at)
                     self._autonomy_store.mark_heartbeat("sleeping_scheduled")
                     return
+            if task is not None and task.schedule_id is not None:
+                self._autonomy_store.update_schedule(
+                    task.schedule_id,
+                    last_started_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="running",
+                )
+            if task is not None and task.source == "scheduled":
+                await self._run_scheduled_task(chat_id, task)
+                return
             await self._run_wakeup(chat_id, task, baseline_signal, active_request_lines)
         finally:
             self._queue_store.release_session_lease(chat_id, "autonomy")
@@ -922,15 +1210,7 @@ class AutonomyWorker:
         latest_user_lines = self._recent_user_lines(chat_id, limit=1)
         latest_user_line = latest_user_lines[0] if latest_user_lines else ""
         if self._looks_like_negative_idle_reply(latest_user_line):
-            self._autonomy_store.mark_idle_snooze_until(
-                chat_id,
-                self._scheduled_after(self._settings.autonomy_idle_sleep_sec),
-            )
-            self._schedule_mode(
-                chat_id,
-                "cooldown",
-                delay_sec=self._settings.autonomy_idle_sleep_sec,
-            )
+            self._schedule_sleeping_user_declined(chat_id)
             self._autonomy_store.mark_heartbeat("sleeping_user_declined")
             return True
         if self._looks_like_positive_need_signal(latest_user_line):
@@ -942,22 +1222,14 @@ class AutonomyWorker:
         if prompted_at and baseline_signal > prompted_signal:
             self._autonomy_store.clear_idle_interest_prompt(chat_id)
             if self._looks_like_negative_idle_reply(latest_user_line):
-                self._autonomy_store.mark_idle_snooze_until(
-                    chat_id,
-                    self._scheduled_after(self._settings.autonomy_idle_sleep_sec),
-                )
-                self._schedule_mode(
-                    chat_id,
-                    "cooldown",
-                    delay_sec=self._settings.autonomy_idle_sleep_sec,
-                )
+                self._schedule_sleeping_user_declined(chat_id)
                 self._autonomy_store.mark_heartbeat("sleeping_user_declined")
                 return True
 
         if self._autonomy_store.idle_snoozed(chat_id):
             self._schedule_mode(
                 chat_id,
-                "cooldown",
+                "sleeping_empty_idle",
                 at=self._autonomy_store.get_idle_snooze_until(chat_id),
             )
             self._autonomy_store.mark_heartbeat("sleeping_idle")
@@ -965,21 +1237,110 @@ class AutonomyWorker:
 
         if mission is None and not self._settings.autonomy_idle_ask_enabled:
             self._autonomy_store.clear_active_mission(chat_id)
-            self._schedule_mode(
-                chat_id,
-                "idle",
-                delay_sec=self._settings.autonomy_default_sleep_sec,
-            )
-            self._autonomy_store.mark_heartbeat("noop")
+            self._schedule_sleeping_empty_idle(chat_id)
+            self._autonomy_store.mark_heartbeat("sleeping_empty_idle")
             return True
 
-        self._schedule_mode(
-            chat_id,
-            "idle",
-            delay_sec=self._settings.autonomy_default_sleep_sec,
-        )
-        self._autonomy_store.mark_heartbeat("sleeping_idle")
+        self._schedule_sleeping_empty_idle(chat_id)
+        self._autonomy_store.mark_heartbeat("sleeping_empty_idle")
         return True
+
+    async def _run_scheduled_task(self, chat_id: int, task: AutonomyTask) -> None:
+        guard_approval_used = False
+        try:
+            self._autonomy_store.set_active_mission(
+                chat_id,
+                task_id=task.id,
+                title=task.title,
+                details=task.details,
+                kind=task.kind,
+                source=task.source,
+                phase="running",
+                scheduled_for=task.scheduled_for,
+            )
+            prompt = build_prompt(
+                user_text=task.details,
+                attachments=[],
+                include_bootstrap=True,
+            )
+            if self._autonomy_store.guard_approved_once(chat_id):
+                guard_approval_used = True
+            result = await self._run_autonomy_codex(chat_id, prompt, "")
+            if result is None:
+                self._autonomy_store.requeue_task(task.id)
+                if task.schedule_id is not None:
+                    self._autonomy_store.update_schedule(
+                        task.schedule_id,
+                        last_status="guard_waiting_approval",
+                    )
+                self._autonomy_store.set_active_mission(
+                    chat_id,
+                    task_id=task.id,
+                    title=task.title,
+                    details=task.details,
+                    kind=task.kind,
+                    source=task.source,
+                    phase="guard_waiting_approval",
+                    scheduled_for=task.scheduled_for,
+                )
+                return
+            if not result.success:
+                self._autonomy_store.fail_task(task.id, result.message)
+                if task.schedule_id is not None:
+                    self._autonomy_store.update_schedule(
+                        task.schedule_id,
+                        last_finished_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="failed",
+                    )
+                self._autonomy_store.clear_active_mission(chat_id)
+                self._guard_end_session(chat_id)
+                self._schedule_mode(
+                    chat_id,
+                    "cooldown",
+                    delay_sec=self._settings.autonomy_default_sleep_sec,
+                )
+                self._autonomy_store.mark_heartbeat("failed")
+                return
+
+            delivery = await deliver_agent_response(
+                bot=self._bot,
+                chat_id=chat_id,
+                settings=self._settings,
+                raw_message=result.message,
+                logger=self._logger,
+            )
+            task_result = parse_agent_response(result.message)
+            composed = "\n\n".join(
+                part
+                for part in (
+                    delivery.final_text,
+                    (
+                        "Отправленные файлы:\n" + "\n".join(f"- {item}" for item in delivery.sent_files)
+                        if delivery.sent_files
+                        else ""
+                    ),
+                    (
+                        "Ошибки отправки файлов:\n" + "\n".join(f"- {item}" for item in delivery.send_errors)
+                        if delivery.send_errors
+                        else ""
+                    ),
+                )
+                if part
+            ).strip() or task_result.text.strip() or "(empty)"
+            self._autonomy_store.complete_task(task.id, composed)
+            if task.schedule_id is not None:
+                self._autonomy_store.update_schedule(
+                    task.schedule_id,
+                    last_finished_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="completed",
+                )
+            self._autonomy_store.clear_active_mission(chat_id)
+            self._schedule_sleeping_completed(chat_id)
+            self._autonomy_store.mark_heartbeat("scheduled_completed")
+            self._journal("completed", task.title, delivery.final_text or composed, task_id=task.id)
+        finally:
+            if guard_approval_used:
+                self._consume_guard_approval(chat_id)
 
     async def _run_wakeup(
         self,
@@ -989,11 +1350,13 @@ class AutonomyWorker:
         active_request_lines: list[str],
     ) -> None:
         self._schedule_mode(chat_id, "active_mission", delay_sec=self._settings.autonomy_busy_retry_sec)
-        session_id = self._queue_store.get_chat_session_id(chat_id)
+        scheduled_task = task is not None and task.source == "scheduled"
+        session_id = "" if scheduled_task else self._queue_store.get_chat_session_id(chat_id)
         current_task = task
         persisted_task_id = task.id if task is not None else None
         persisted_task_source = task.source if task is not None else "heartbeat"
         persisted_parent_id = task.parent_task_id if task is not None else None
+        task_schedule_id = task.schedule_id if task is not None else None
         current_title = task.title if task is not None else ""
         current_details = task.details if task is not None else ""
         current_kind = task.kind if task is not None else "general"
@@ -1001,10 +1364,11 @@ class AutonomyWorker:
         step_results: list[str] = []
         step_self_reviews: list[str] = []
         parsed_texts: list[str] = []
+        guard_approval_used = False
         mission = self._ensure_mission(
             chat_id=chat_id,
             task=current_task,
-            active_request_lines=active_request_lines,
+            active_request_lines=[] if scheduled_task else active_request_lines,
         )
         persisted_mission_id = mission.id
 
@@ -1025,101 +1389,158 @@ class AutonomyWorker:
         )
         mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
 
-        for step_index in range(self._settings.autonomy_session_step_limit):
-            current_stage = self._current_stage(mission)
-            next_stage = self._next_stage(mission)
-            prompt = build_autonomy_wakeup_prompt(
-                current_task_id=persisted_task_id,
-                current_task_title=current_title,
-                current_task_details=current_details,
-                current_task_kind=current_kind,
-                current_task_continuation_count=current_task.continuation_count if current_task is not None else 0,
-                mission_source=mission.source,
-                mission_root_objective=mission.root_objective,
-                mission_success_criteria=mission.success_criteria,
-                mission_plan_state=mission.plan_state,
-                mission_current_stage=(current_stage or {}).get("title", ""),
-                mission_current_stage_goal=(current_stage or {}).get("goal", ""),
-                mission_current_stage_done_when=(current_stage or {}).get("done_when", ""),
-                mission_next_stage=(next_stage or {}).get("title", ""),
-                mission_current_focus=mission.current_focus or current_title,
-                mission_last_checkpoint=mission.last_checkpoint_summary,
-                mission_last_self_check=mission.last_self_check_summary,
-                mission_recent_checkpoints=self._recent_checkpoint_lines(mission),
-                mission_recent_lines=self._recent_mission_lines(persisted_mission_id),
-                active_request_lines=active_request_lines,
-                recent_task_lines=self._recent_task_lines(chat_id),
-                recent_journal_lines=self._recent_journal_lines(),
-                recent_user_lines=self._recent_user_lines(chat_id),
-                include_bootstrap=not bool(session_id),
-            )
-            result = await asyncio.to_thread(self._runner.run, prompt, session_id)
-
-            if result.session_id and result.session_id != session_id:
-                session_id = result.session_id
-                self._queue_store.set_chat_session_id(chat_id, result.session_id)
-
-            user_signal_changed = self._queue_store.get_user_signal(chat_id) != baseline_signal
-            suffix = ""
-            if user_signal_changed:
-                suffix = "\n\n[autonomy-paused: user activity detected]"
-
-            if not result.success:
-                failure_text = (result.message or "").strip() + suffix
-                if persisted_task_id is not None:
-                    self._autonomy_store.fail_task(persisted_task_id, failure_text)
-                self._autonomy_store.clear_active_mission(chat_id)
-                self._autonomy_store.abandon_mission(
-                    persisted_mission_id,
-                    reason=(result.message or "Автономная задача завершилась ошибкой.").strip(),
-                    current_focus=current_title or mission.current_focus,
+        try:
+            for step_index in range(self._settings.autonomy_session_step_limit):
+                current_stage = self._current_stage(mission)
+                next_stage = self._next_stage(mission)
+                prompt = build_autonomy_wakeup_prompt(
+                    current_task_id=persisted_task_id,
+                    current_task_title=current_title,
+                    current_task_details=current_details,
+                    current_task_kind=current_kind,
+                    current_task_continuation_count=current_task.continuation_count if current_task is not None else 0,
+                    mission_source=mission.source,
+                    mission_root_objective=mission.root_objective,
+                    mission_success_criteria=mission.success_criteria,
+                    mission_plan_state=mission.plan_state,
+                    mission_current_stage=(current_stage or {}).get("title", ""),
+                    mission_current_stage_goal=(current_stage or {}).get("goal", ""),
+                    mission_current_stage_done_when=(current_stage or {}).get("done_when", ""),
+                    mission_next_stage=(next_stage or {}).get("title", ""),
+                    mission_current_focus=mission.current_focus or current_title,
+                    mission_last_checkpoint=mission.last_checkpoint_summary,
+                    mission_last_self_check=mission.last_self_check_summary,
+                    mission_recent_checkpoints=self._recent_checkpoint_lines(mission),
+                    mission_recent_lines=self._recent_mission_lines(persisted_mission_id),
+                    active_request_lines=[] if scheduled_task else active_request_lines,
+                    recent_task_lines=self._recent_task_lines(chat_id),
+                    recent_journal_lines=self._recent_journal_lines(),
+                    recent_user_lines=[] if scheduled_task else self._recent_user_lines(chat_id),
+                    include_bootstrap=not bool(session_id),
                 )
-                self._schedule_mode(
-                    chat_id,
-                    "cooldown",
-                    delay_sec=self._settings.autonomy_default_sleep_sec,
-                )
-                if persisted_task_id is not None:
-                    self._journal(
-                        "failed",
-                        current_title or "Автономный шаг",
-                        (result.message or "Автономная задача завершилась ошибкой.").strip(),
+                if self._autonomy_store.guard_approved_once(chat_id):
+                    guard_approval_used = True
+                result = await self._run_autonomy_codex(chat_id, prompt, session_id)
+                if result is None:
+                    if persisted_task_id is not None:
+                        self._autonomy_store.requeue_task(persisted_task_id)
+                        if task_schedule_id is not None:
+                            self._autonomy_store.update_schedule(
+                                task_schedule_id,
+                                last_status="guard_waiting_approval",
+                            )
+                    self._autonomy_store.set_active_mission(
+                        chat_id,
                         task_id=persisted_task_id,
+                        title=current_title or mission.current_focus or "Автономный сеанс",
+                        details=current_details,
+                        kind=current_kind,
+                        source=persisted_task_source,
+                        phase="guard_waiting_approval",
+                        scheduled_for=current_task.scheduled_for if current_task is not None else "",
                     )
-                self._autonomy_store.mark_heartbeat(
-                    "failed_after_user_interrupt" if user_signal_changed else "failed"
-                )
-                return
+                    return
 
-            clean_message, continuation = extract_autonomy_continuation(result.message or "")
-            clean_message, mission_plan = extract_mission_plan(clean_message)
-            clean_message, self_review = extract_self_review(clean_message)
-            decision = parse_wakeup_decision(clean_message)
-            if (
-                decision.action != "STEP"
-                and clean_message.strip()
-                and clean_message.strip().upper() != "ACTION: NOOP"
-            ):
-                fallback_title = current_title or mission.current_focus or "Автономный шаг"
-                fallback_kind = current_kind or "general"
-                fallback_details = current_details or ""
-                decision = parse_wakeup_decision(
-                    "\n".join(
-                        [
-                            "ACTION: STEP",
-                            f"TITLE: {fallback_title}",
-                            f"KIND: {fallback_kind}",
-                            "PRIORITY: 100",
-                            "DETAILS:",
-                            fallback_details,
-                            "RESULT:",
-                            clean_message.strip(),
-                        ]
-                    ).strip()
-                )
+                if result.session_id and result.session_id != session_id:
+                    session_id = result.session_id
+                    self._queue_store.set_chat_session_id(chat_id, result.session_id)
 
-            if decision.action == "COMPLETE":
-                if persisted_task_id is None:
+                user_signal_changed = self._queue_store.get_user_signal(chat_id) != baseline_signal
+                suffix = "\n\n[autonomy-paused: user activity detected]" if user_signal_changed else ""
+
+                if not result.success:
+                    failure_text = (result.message or "").strip() + suffix
+                    if persisted_task_id is not None:
+                        self._autonomy_store.fail_task(persisted_task_id, failure_text)
+                    if task_schedule_id is not None:
+                        self._autonomy_store.update_schedule(
+                            task_schedule_id,
+                            last_finished_at=datetime.now(timezone.utc).isoformat(),
+                            last_status="failed",
+                        )
+                    self._autonomy_store.clear_active_mission(chat_id)
+                    self._guard_end_session(chat_id)
+                    self._autonomy_store.abandon_mission(
+                        persisted_mission_id,
+                        reason=(result.message or "Автономная задача завершилась ошибкой.").strip(),
+                        current_focus=current_title or mission.current_focus,
+                    )
+                    self._schedule_mode(
+                        chat_id,
+                        "cooldown",
+                        delay_sec=self._settings.autonomy_default_sleep_sec,
+                    )
+                    if persisted_task_id is not None:
+                        self._journal(
+                            "failed",
+                            current_title or "Автономный шаг",
+                            (result.message or "Автономная задача завершилась ошибкой.").strip(),
+                            task_id=persisted_task_id,
+                        )
+                    self._autonomy_store.mark_heartbeat(
+                        "failed_after_user_interrupt" if user_signal_changed else "failed"
+                    )
+                    return
+
+                clean_message, continuation = extract_autonomy_continuation(result.message or "")
+                clean_message, mission_plan = extract_mission_plan(clean_message)
+                clean_message, self_review = extract_self_review(clean_message)
+                decision = parse_wakeup_decision(clean_message)
+                if (
+                    decision.action != "STEP"
+                    and clean_message.strip()
+                    and clean_message.strip().upper() != "ACTION: NOOP"
+                ):
+                    fallback_title = current_title or mission.current_focus or "Автономный шаг"
+                    fallback_kind = current_kind or "general"
+                    fallback_details = current_details or ""
+                    decision = parse_wakeup_decision(
+                        "\n".join(
+                            [
+                                "ACTION: STEP",
+                                f"TITLE: {fallback_title}",
+                                f"KIND: {fallback_kind}",
+                                "PRIORITY: 100",
+                                "DETAILS:",
+                                fallback_details,
+                                "RESULT:",
+                                clean_message.strip(),
+                            ]
+                        ).strip()
+                    )
+
+                if decision.action == "COMPLETE":
+                    if persisted_task_id is None:
+                        self._autonomy_store.complete_mission(
+                            persisted_mission_id,
+                            current_focus=current_title or mission.current_focus,
+                            last_self_check_summary=self._build_self_check_summary(decision),
+                        )
+                        self._autonomy_store.clear_active_mission(chat_id)
+                        self._schedule_mode(
+                            chat_id,
+                            "idle",
+                            delay_sec=self._settings.autonomy_default_sleep_sec,
+                        )
+                        self._autonomy_store.mark_heartbeat(
+                            "noop_after_user_interrupt" if user_signal_changed else "noop"
+                        )
+                        return
+
+                    result_text = decision.result_text.strip() or "Текущая автономная задача закрыта без дополнительного шага."
+                    final_text = "\n\n".join([*step_results, result_text]).strip()
+                    stored = self._compose_stored_result(
+                        final_text,
+                        suffix=suffix,
+                        self_reviews=step_self_reviews,
+                    )
+                    self._autonomy_store.complete_task(persisted_task_id, stored)
+                    if task_schedule_id is not None:
+                        self._autonomy_store.update_schedule(
+                            task_schedule_id,
+                            last_finished_at=datetime.now(timezone.utc).isoformat(),
+                            last_status="completed",
+                        )
                     self._autonomy_store.complete_mission(
                         persisted_mission_id,
                         current_focus=current_title or mission.current_focus,
@@ -1131,225 +1552,524 @@ class AutonomyWorker:
                         "idle",
                         delay_sec=self._settings.autonomy_default_sleep_sec,
                     )
+                    parsed = parse_agent_response(final_text)
+                    await self._maybe_notify_completion(
+                        chat_id=chat_id,
+                        task=AutonomyTask(
+                            id=persisted_task_id,
+                            chat_id=chat_id,
+                            mission_id=persisted_mission_id,
+                            kind=current_kind or "general",
+                            title=current_title or "Автономный шаг",
+                            details=current_details,
+                            priority=current_priority,
+                            status="done",
+                            created_at=task.created_at if task is not None else "",
+                            scheduled_for=task.scheduled_for if task is not None else "",
+                            parent_task_id=persisted_parent_id,
+                            source=persisted_task_source,
+                            started_at=task.started_at if task is not None else None,
+                            finished_at=None,
+                            blocked_user_signal=None,
+                            result_text=final_text,
+                            error_text="",
+                            schedule_id=task_schedule_id,
+                        ),
+                        text=parsed.text,
+                        file_paths=parsed.file_paths,
+                        user_signal_changed=user_signal_changed,
+                        raw_message=final_text,
+                    )
+                    self._autonomy_store.mark_heartbeat(
+                        "closed_after_user_interrupt" if user_signal_changed else "closed"
+                    )
+                    summary = parsed.text or final_text
+                    self._journal(
+                        "completed",
+                        current_title or mission.current_focus or "Автономный шаг",
+                        summary,
+                        task_id=persisted_task_id,
+                    )
+                    return
+
+                if decision.action != "STEP":
+                    if persisted_task_id is not None:
+                        self._autonomy_store.requeue_task(persisted_task_id)
+                        if task_schedule_id is not None:
+                            self._autonomy_store.update_schedule(
+                                task_schedule_id,
+                                last_status="scheduled",
+                            )
+                        self._autonomy_store.set_active_mission(
+                            chat_id,
+                            task_id=persisted_task_id,
+                            title=current_title or mission.current_focus or "Автономный сеанс",
+                            details=current_details,
+                            kind=current_kind,
+                            source=persisted_task_source,
+                            phase="scheduled" if current_task is not None and current_task.scheduled_for else "running",
+                            scheduled_for=current_task.scheduled_for if current_task is not None else "",
+                        )
+                        self._autonomy_store.update_mission(
+                            persisted_mission_id,
+                            status="active",
+                            current_focus=current_title or mission.current_focus,
+                        )
+                    self._schedule_mode(
+                        chat_id,
+                        "idle",
+                        delay_sec=self._settings.autonomy_default_sleep_sec,
+                    )
                     self._autonomy_store.mark_heartbeat(
                         "noop_after_user_interrupt" if user_signal_changed else "noop"
                     )
                     return
 
-                result_text = decision.result_text.strip() or "Текущая автономная задача закрыта без дополнительного шага."
-                final_text = "\n\n".join([*step_results, result_text]).strip()
-                stored = self._compose_stored_result(
-                    final_text,
-                    suffix=suffix,
-                    self_reviews=step_self_reviews,
+                effective_title = decision.title.strip() or (current_title or mission.current_focus or "Автономный шаг")
+                effective_kind = decision.kind.strip() or (current_kind or "general")
+                effective_details = decision.details.strip() or current_details
+                effective_priority = decision.priority
+                result_text = decision.result_text.strip() or clean_message.strip()
+                self_check_summary = self._build_self_check_summary(decision)
+                mission = self._sync_mission_plan(
+                    mission,
+                    decision=decision,
+                    extracted_plan=mission_plan,
+                    current_focus=effective_title,
                 )
-                self._autonomy_store.complete_task(persisted_task_id, stored)
-                self._autonomy_store.complete_mission(
-                    persisted_mission_id,
-                    current_focus=current_title or mission.current_focus,
-                    last_self_check_summary=self._build_self_check_summary(decision),
+                if self_review is not None:
+                    step_self_reviews.append(
+                        self._format_self_review_block(
+                            self_review.change,
+                            self_review.why,
+                            self_review.risk,
+                            self_review.check,
+                        )
+                    )
+                blocks_on_user = self._needs_user_response_pause(result_text) or decision.blocker_type == "user"
+                proposed_mission_status = self._infer_mission_status(
+                    decision_action=decision.action,
+                    declared_mission_status=decision.mission_status,
+                    continuation_present=continuation is not None,
+                    continuation_delay_sec=continuation.delay_sec if continuation is not None else 0,
+                    blocks_on_user=blocks_on_user,
                 )
-                self._autonomy_store.clear_active_mission(chat_id)
-                self._schedule_mode(
-                    chat_id,
-                    "idle",
-                    delay_sec=self._settings.autonomy_default_sleep_sec,
+                staged_mission = mission.plan_state == "staged" and self._current_stage(mission) is not None
+                proposed_stage_status = self._infer_stage_status(
+                    decision,
+                    proposed_mission_status,
+                    staged_mission,
                 )
-                parsed = parse_agent_response(final_text)
-                await self._maybe_notify_completion(
-                    chat_id=chat_id,
-                    task=AutonomyTask(
-                        id=persisted_task_id,
+                checkpoint_summary = decision.checkpoint_summary.strip() or result_text
+
+                if (
+                    persisted_task_id is None
+                    and blocks_on_user
+                    and self._has_duplicate_waiting_blocker(chat_id, result_text)
+                ):
+                    self._autonomy_store.block_mission(
+                        persisted_mission_id,
+                        reason=result_text,
+                        current_focus=effective_title,
+                        last_checkpoint_summary=checkpoint_summary[:600],
+                        last_self_check_summary=self_check_summary,
+                    )
+                    self._schedule_mode(
+                        chat_id,
+                        "waiting_user",
+                        delay_sec=self._settings.autonomy_idle_sleep_sec,
+                    )
+                    self._autonomy_store.mark_heartbeat("noop")
+                    return
+
+                if persisted_task_id is None:
+                    persisted_task_id = self._autonomy_store.enqueue_task(
                         chat_id=chat_id,
                         mission_id=persisted_mission_id,
-                        kind=current_kind or "general",
-                        title=current_title or "Автономный шаг",
-                        details=current_details,
-                        priority=current_priority,
-                        status="done",
-                        created_at=task.created_at if task is not None else "",
-                        scheduled_for=task.scheduled_for if task is not None else "",
-                        parent_task_id=persisted_parent_id,
-                        source=persisted_task_source,
-                        started_at=task.started_at if task is not None else None,
-                        finished_at=None,
-                        blocked_user_signal=None,
-                        result_text=final_text,
-                        error_text="",
-                    ),
-                    text=parsed.text,
-                    file_paths=parsed.file_paths,
-                    user_signal_changed=user_signal_changed,
-                    raw_message=final_text,
-                )
-                self._autonomy_store.mark_heartbeat(
-                    "closed_after_user_interrupt" if user_signal_changed else "closed"
-                )
-                summary = parsed.text or final_text
-                self._journal("completed", current_title or mission.current_focus or "Автономный шаг", summary, task_id=persisted_task_id)
-                return
+                        schedule_id=task_schedule_id,
+                        title=effective_title,
+                        details=effective_details,
+                        kind=effective_kind,
+                        priority=effective_priority,
+                        source="heartbeat",
+                    )
+                    persisted_task_source = "heartbeat"
+                elif current_task is not None and current_task.mission_id != persisted_mission_id:
+                    self._autonomy_store.set_task_mission(persisted_task_id, persisted_mission_id)
+                    current_task.mission_id = persisted_mission_id
 
-            if decision.action != "STEP":
-                if persisted_task_id is not None:
-                    self._autonomy_store.requeue_task(persisted_task_id)
-                    self._autonomy_store.set_active_mission(
-                        chat_id,
-                        task_id=persisted_task_id,
-                        title=current_title or mission.current_focus or "Автономный сеанс",
-                        details=current_details,
-                        kind=current_kind,
-                        source=persisted_task_source,
-                        phase="scheduled" if current_task is not None and current_task.scheduled_for else "running",
-                        scheduled_for=current_task.scheduled_for if current_task is not None else "",
-                    )
-                    self._autonomy_store.update_mission(
-                        persisted_mission_id,
-                        status="active",
-                        current_focus=current_title or mission.current_focus,
-                    )
-                self._schedule_mode(
+                self._autonomy_store.set_active_mission(
                     chat_id,
-                    "idle",
-                    delay_sec=self._settings.autonomy_default_sleep_sec,
+                    task_id=persisted_task_id,
+                    title=effective_title,
+                    details=effective_details,
+                    kind=effective_kind,
+                    source=persisted_task_source,
+                    phase="running",
+                    scheduled_for=current_task.scheduled_for if current_task is not None else "",
                 )
-                self._autonomy_store.mark_heartbeat(
-                    "noop_after_user_interrupt" if user_signal_changed else "noop"
-                )
-                return
-
-            effective_title = decision.title.strip() or (current_title or mission.current_focus or "Автономный шаг")
-            effective_kind = decision.kind.strip() or (current_kind or "general")
-            effective_details = decision.details.strip() or current_details
-            effective_priority = decision.priority
-            result_text = decision.result_text.strip() or clean_message.strip()
-            self_check_summary = self._build_self_check_summary(decision)
-            mission = self._sync_mission_plan(
-                mission,
-                decision=decision,
-                extracted_plan=mission_plan,
-                current_focus=effective_title,
-            )
-            if self_review is not None:
-                step_self_reviews.append(
-                    self._format_self_review_block(
-                        self_review.change,
-                        self_review.why,
-                        self_review.risk,
-                        self_review.check,
-                    )
-                )
-            blocks_on_user = self._needs_user_response_pause(result_text) or decision.blocker_type == "user"
-            proposed_mission_status = self._infer_mission_status(
-                decision_action=decision.action,
-                declared_mission_status=decision.mission_status,
-                continuation_present=continuation is not None,
-                continuation_delay_sec=continuation.delay_sec if continuation is not None else 0,
-                blocks_on_user=blocks_on_user,
-            )
-            staged_mission = mission.plan_state == "staged" and self._current_stage(mission) is not None
-            proposed_stage_status = self._infer_stage_status(
-                decision,
-                proposed_mission_status,
-                staged_mission,
-            )
-            checkpoint_summary = decision.checkpoint_summary.strip() or result_text
-
-            if (
-                persisted_task_id is None
-                and blocks_on_user
-                and self._has_duplicate_waiting_blocker(chat_id, result_text)
-            ):
-                self._autonomy_store.block_mission(
+                self._autonomy_store.update_mission(
                     persisted_mission_id,
-                    reason=result_text,
+                    status="active",
                     current_focus=effective_title,
                     last_checkpoint_summary=checkpoint_summary[:600],
                     last_self_check_summary=self_check_summary,
                 )
-                self._schedule_mode(
-                    chat_id,
-                    "waiting_user",
-                    delay_sec=self._settings.autonomy_idle_sleep_sec,
+                mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
+
+                current_title = effective_title
+                current_kind = effective_kind
+                current_details = effective_details
+                current_priority = effective_priority
+                step_results.append(result_text)
+                parsed = parse_agent_response(result_text)
+                if parsed.text:
+                    parsed_texts.append(parsed.text)
+
+                if blocks_on_user or proposed_mission_status == "blocked_user":
+                    final_text = "\n\n".join(step_results).strip()
+                    self._autonomy_store.wait_for_user(
+                        persisted_task_id,
+                        self._compose_stored_result(
+                            final_text,
+                            suffix=suffix,
+                            self_reviews=step_self_reviews,
+                        ),
+                        user_signal=baseline_signal,
+                    )
+                    if task_schedule_id is not None:
+                        self._autonomy_store.update_schedule(
+                            task_schedule_id,
+                            last_finished_at=datetime.now(timezone.utc).isoformat(),
+                            last_status="waiting_user",
+                        )
+                    self._schedule_mode(
+                        chat_id,
+                        "waiting_user",
+                        delay_sec=self._settings.autonomy_idle_sleep_sec,
+                    )
+                    self._autonomy_store.set_active_mission(
+                        chat_id,
+                        task_id=persisted_task_id,
+                        title=current_title,
+                        details=current_details,
+                        kind=current_kind,
+                        source=persisted_task_source,
+                        phase="waiting_user",
+                        scheduled_for="",
+                    )
+                    self._autonomy_store.block_mission(
+                        persisted_mission_id,
+                        reason=decision.why_not_done_now or result_text,
+                        current_focus=current_title,
+                        last_checkpoint_summary=checkpoint_summary[:600],
+                        last_self_check_summary=self_check_summary,
+                    )
+                    await self._maybe_notify_completion(
+                        chat_id=chat_id,
+                        task=AutonomyTask(
+                            id=persisted_task_id,
+                            chat_id=chat_id,
+                            mission_id=persisted_mission_id,
+                            kind=current_kind,
+                            title=current_title,
+                            details=current_details,
+                            priority=current_priority,
+                            status="waiting_user",
+                            created_at=task.created_at if task is not None else "",
+                            scheduled_for="",
+                            parent_task_id=persisted_parent_id,
+                            source=persisted_task_source,
+                            started_at=task.started_at if task is not None else None,
+                            finished_at=None,
+                            blocked_user_signal=baseline_signal,
+                            result_text=final_text,
+                            error_text="",
+                            schedule_id=task_schedule_id,
+                        ),
+                        text=parsed.text,
+                        file_paths=parsed.file_paths,
+                        user_signal_changed=user_signal_changed,
+                        raw_message=final_text,
+                    )
+                    self._autonomy_store.mark_heartbeat(
+                        "waiting_after_user_interrupt" if user_signal_changed else "waiting_user"
+                    )
+                    summary = parsed.text or final_text
+                    if user_signal_changed:
+                        summary += " Во время шага пришло сообщение владельца."
+                    self._journal("waiting_user", current_title, summary, task_id=persisted_task_id)
+                    return
+
+                control_verdict = ""
+                if (
+                    not user_signal_changed
+                    and (
+                        continuation is not None
+                        or proposed_mission_status in {"continue_now", "follow_up_later", "blocked_user"}
+                        or (current_task is not None and current_task.continuation_count > 0)
+                    )
+                ):
+                    control_verdict, next_session_id = await self._run_control_pass(
+                        mission=mission,
+                        step_title=effective_title,
+                        step_result=result_text,
+                        proposed_mission_status=proposed_mission_status,
+                        proposed_stage_status=proposed_stage_status,
+                        proposed_next_title=continuation.title if continuation is not None else effective_title,
+                        proposed_next_details=continuation.details if continuation is not None else effective_details,
+                        proposed_delay_sec=continuation.delay_sec if continuation is not None else None,
+                        why_not_done_now=decision.why_not_done_now,
+                        blocker_type=decision.blocker_type,
+                        next_step_justification=decision.next_step_justification,
+                        session_id=session_id,
+                    )
+                    session_id = next_session_id
+                    if session_id:
+                        self._queue_store.set_chat_session_id(chat_id, session_id)
+                    if control_verdict == "GUARD_WAITING_APPROVAL":
+                        if persisted_task_id is not None:
+                            self._autonomy_store.requeue_task(persisted_task_id)
+                            if task_schedule_id is not None:
+                                self._autonomy_store.update_schedule(
+                                    task_schedule_id,
+                                    last_status="guard_waiting_approval",
+                                )
+                        self._autonomy_store.set_active_mission(
+                            chat_id,
+                            task_id=persisted_task_id,
+                            title=current_title,
+                            details=current_details,
+                            kind=current_kind,
+                            source=persisted_task_source,
+                            phase="guard_waiting_approval",
+                            scheduled_for=current_task.scheduled_for if current_task is not None else "",
+                        )
+                        return
+                    if control_verdict == "FORCE_COMPLETE":
+                        proposed_mission_status = "complete"
+                        proposed_stage_status = "complete_mission"
+                        continuation = None
+                    elif control_verdict == "FORCE_BLOCKED_USER":
+                        proposed_mission_status = "blocked_user"
+                        proposed_stage_status = "blocked_user"
+                        continuation = None
+                    elif control_verdict == "FORCE_STAGE_DONE":
+                        proposed_stage_status = "stage_done"
+                    elif control_verdict == "APPROVE_CONTINUE_NOW":
+                        proposed_mission_status = "continue_now"
+                    elif control_verdict == "APPROVE_FOLLOWUP":
+                        proposed_mission_status = "follow_up_later"
+                    elif control_verdict == "REJECT_AS_MICROSTEP":
+                        proposed_mission_status = "continue_now"
+                        if continuation is None:
+                            continuation = AutonomyContinuation(
+                                action="ENQUEUE",
+                                title=effective_title,
+                                kind=effective_kind,
+                                priority=effective_priority,
+                                delay_sec=0,
+                                details=effective_details or current_details or mission.current_focus or mission.root_objective,
+                            )
+
+                if mission.plan_state == "staged":
+                    if proposed_stage_status == "stage_done":
+                        mission = self._advance_stage(
+                            mission,
+                            completion_summary=checkpoint_summary,
+                        )
+                        current_stage = self._current_stage(mission)
+                        if current_stage is None:
+                            proposed_stage_status = "complete_mission"
+                            proposed_mission_status = "complete"
+                            continuation = None
+                        else:
+                            stage_details = "\n".join(
+                                part
+                                for part in (
+                                    current_stage.get("goal", "").strip(),
+                                    (
+                                        f"Готовность этапа: {current_stage.get('done_when', '').strip()}"
+                                        if current_stage.get("done_when", "").strip()
+                                        else ""
+                                    ),
+                                )
+                                if part
+                            ).strip()
+                            continuation = AutonomyContinuation(
+                                action="ENQUEUE",
+                                title=current_stage.get("title", "").strip() or effective_title,
+                                kind=effective_kind,
+                                priority=effective_priority,
+                                delay_sec=0,
+                                details=stage_details or effective_details or mission.current_focus or mission.root_objective,
+                            )
+                            if proposed_mission_status not in {"blocked_user", "complete"}:
+                                proposed_mission_status = (
+                                    "continue_now"
+                                    if (not user_signal_changed and step_index + 1 < self._settings.autonomy_session_step_limit)
+                                    else "follow_up_later"
+                                )
+                    elif proposed_stage_status == "blocked_user":
+                        mission = self._advance_stage(
+                            mission,
+                            completion_summary=checkpoint_summary,
+                            blocked=True,
+                        )
+                    elif proposed_mission_status in {"continue_now", "follow_up_later"} and continuation is None:
+                        current_stage = self._current_stage(mission)
+                        if current_stage is not None:
+                            stage_details = "\n".join(
+                                part
+                                for part in (
+                                    current_stage.get("goal", "").strip(),
+                                    (
+                                        f"Готовность этапа: {current_stage.get('done_when', '').strip()}"
+                                        if current_stage.get("done_when", "").strip()
+                                        else ""
+                                    ),
+                                )
+                                if part
+                            ).strip()
+                            continuation = AutonomyContinuation(
+                                action="ENQUEUE",
+                                title=current_stage.get("title", "").strip() or effective_title,
+                                kind=effective_kind,
+                                priority=effective_priority,
+                                delay_sec=0 if proposed_mission_status == "continue_now" else self._settings.autonomy_default_sleep_sec,
+                                details=stage_details or effective_details or mission.current_focus or mission.root_objective,
+                            )
+
+                inline_continue = (
+                    not user_signal_changed
+                    and proposed_mission_status == "continue_now"
+                    and step_index + 1 < self._settings.autonomy_session_step_limit
                 )
-                self._autonomy_store.mark_heartbeat("noop")
-                return
+                if inline_continue:
+                    if continuation is not None:
+                        current_title = continuation.title.strip() or effective_title
+                        current_kind = continuation.kind.strip() or effective_kind
+                        current_details = continuation.details.strip() or effective_details
+                        current_priority = continuation.priority
+                    else:
+                        current_title = effective_title
+                        current_kind = effective_kind
+                        current_details = effective_details
+                        current_priority = effective_priority
+                    self._autonomy_store.update_mission(
+                        persisted_mission_id,
+                        status="active",
+                        current_focus=current_title,
+                        last_self_check_summary=self_check_summary,
+                    )
+                    mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
+                    continue
 
-            if persisted_task_id is None:
-                persisted_task_id = self._autonomy_store.enqueue_task(
-                    chat_id=chat_id,
-                    mission_id=persisted_mission_id,
-                    title=effective_title,
-                    details=effective_details,
-                    kind=effective_kind,
-                    priority=effective_priority,
-                    source="heartbeat",
-                )
-                persisted_task_source = "heartbeat"
-            elif current_task is not None and current_task.mission_id != persisted_mission_id:
-                self._autonomy_store.set_task_mission(persisted_task_id, persisted_mission_id)
-                current_task.mission_id = persisted_mission_id
-
-            self._autonomy_store.set_active_mission(
-                chat_id,
-                task_id=persisted_task_id,
-                title=effective_title,
-                details=effective_details,
-                kind=effective_kind,
-                source=persisted_task_source,
-                phase="running",
-                scheduled_for=current_task.scheduled_for if current_task is not None else "",
-            )
-            self._autonomy_store.update_mission(
-                persisted_mission_id,
-                status="active",
-                current_focus=effective_title,
-                last_checkpoint_summary=checkpoint_summary[:600],
-                last_self_check_summary=self_check_summary,
-            )
-            mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
-
-            current_title = effective_title
-            current_kind = effective_kind
-            current_details = effective_details
-            current_priority = effective_priority
-            step_results.append(result_text)
-            parsed = parse_agent_response(result_text)
-            if parsed.text:
-                parsed_texts.append(parsed.text)
-
-            if blocks_on_user or proposed_mission_status == "blocked_user":
                 final_text = "\n\n".join(step_results).strip()
-                self._autonomy_store.wait_for_user(
-                    persisted_task_id,
-                    self._compose_stored_result(
-                        final_text,
-                        suffix=suffix,
-                        self_reviews=step_self_reviews,
-                    ),
-                    user_signal=baseline_signal,
+                continued_task = False
+                notification_task_status = "done"
+                notification_task_scheduled_for = ""
+                journal_status = "completed"
+                continuation_limit_reached = (
+                    current_task is not None
+                    and current_task.continuation_count >= self._settings.autonomy_max_task_continuations
                 )
-                self._schedule_mode(
-                    chat_id,
-                    "waiting_user",
-                    delay_sec=self._settings.autonomy_idle_sleep_sec,
-                )
-                self._autonomy_store.set_active_mission(
-                    chat_id,
-                    task_id=persisted_task_id,
-                    title=current_title,
-                    details=current_details,
-                    kind=current_kind,
-                    source=persisted_task_source,
-                    phase="waiting_user",
-                    scheduled_for="",
-                )
-                self._autonomy_store.block_mission(
-                    persisted_mission_id,
-                    reason=decision.why_not_done_now or result_text,
-                    current_focus=current_title,
-                    last_checkpoint_summary=checkpoint_summary[:600],
-                    last_self_check_summary=self_check_summary,
-                )
+                if (
+                    continuation is not None
+                    and proposed_mission_status == "follow_up_later"
+                    and not user_signal_changed
+                    and continuation_limit_reached
+                ):
+                    final_text = (
+                        f"{final_text}\n\n[autonomy-followup-suppressed: continuation limit reached]"
+                    ).strip()
+                    proposed_mission_status = "complete"
+
+                if (
+                    continuation is not None
+                    and proposed_mission_status == "follow_up_later"
+                    and not user_signal_changed
+                    and not continuation_limit_reached
+                ):
+                    followup_delay_sec = max(1, continuation.delay_sec)
+                    next_title = continuation.title.strip() or current_title
+                    next_details = continuation.details.strip() or current_details
+                    next_kind = continuation.kind.strip() or current_kind
+                    next_priority = continuation.priority
+                    next_scheduled_for = self._scheduled_after(followup_delay_sec)
+                    self._autonomy_store.continue_task(
+                        persisted_task_id,
+                        mission_id=persisted_mission_id,
+                        title=next_title,
+                        details=next_details,
+                        kind=next_kind,
+                        priority=next_priority,
+                        scheduled_for=next_scheduled_for,
+                        progress_text=self._compose_stored_result(
+                            final_text,
+                            suffix=suffix,
+                            self_reviews=step_self_reviews,
+                        ),
+                    )
+                    if task_schedule_id is not None:
+                        self._autonomy_store.update_schedule(
+                            task_schedule_id,
+                            last_status="scheduled",
+                        )
+                    self._autonomy_store.set_active_mission(
+                        chat_id,
+                        task_id=persisted_task_id,
+                        title=next_title,
+                        details=next_details,
+                        kind=next_kind,
+                        source=persisted_task_source,
+                        phase="scheduled",
+                        scheduled_for=next_scheduled_for,
+                    )
+                    self._autonomy_store.update_mission(
+                        persisted_mission_id,
+                        status="active",
+                        current_focus=next_title,
+                        last_self_check_summary=self_check_summary,
+                    )
+                    self._schedule_mode(chat_id, "sleeping_scheduled", delay_sec=followup_delay_sec)
+                    continued_task = True
+                    current_title = next_title
+                    current_details = next_details
+                    current_kind = next_kind
+                    current_priority = next_priority
+                    notification_task_status = "pending"
+                    notification_task_scheduled_for = next_scheduled_for
+                    journal_status = "continued"
+                else:
+                    if active_request_lines:
+                        self._schedule_mode(
+                            chat_id,
+                            "cooldown",
+                            delay_sec=self._settings.autonomy_default_sleep_sec,
+                        )
+                    else:
+                        self._schedule_sleeping_completed(chat_id)
+                    self._autonomy_store.complete_task(
+                        persisted_task_id,
+                        self._compose_stored_result(
+                            final_text,
+                            suffix=suffix,
+                            self_reviews=step_self_reviews,
+                        ),
+                    )
+                    if task_schedule_id is not None:
+                        self._autonomy_store.update_schedule(
+                            task_schedule_id,
+                            last_finished_at=datetime.now(timezone.utc).isoformat(),
+                            last_status="completed",
+                        )
+                    self._autonomy_store.clear_active_mission(chat_id)
+                    self._autonomy_store.complete_mission(
+                        persisted_mission_id,
+                        current_focus=current_title,
+                        last_self_check_summary=self_check_summary,
+                    )
                 await self._maybe_notify_completion(
                     chat_id=chat_id,
                     task=AutonomyTask(
@@ -1360,305 +2080,38 @@ class AutonomyWorker:
                         title=current_title,
                         details=current_details,
                         priority=current_priority,
-                        status="waiting_user",
+                        status=notification_task_status,
                         created_at=task.created_at if task is not None else "",
-                        scheduled_for="",
+                        scheduled_for=notification_task_scheduled_for,
                         parent_task_id=persisted_parent_id,
                         source=persisted_task_source,
                         started_at=task.started_at if task is not None else None,
                         finished_at=None,
-                        blocked_user_signal=baseline_signal,
+                        blocked_user_signal=None,
                         result_text=final_text,
                         error_text="",
+                        schedule_id=task_schedule_id,
                     ),
-                    text=parsed.text,
+                    text="\n\n".join(parsed_texts).strip() or final_text,
                     file_paths=parsed.file_paths,
                     user_signal_changed=user_signal_changed,
                     raw_message=final_text,
                 )
                 self._autonomy_store.mark_heartbeat(
-                    "waiting_after_user_interrupt" if user_signal_changed else "waiting_user"
+                    "completed_after_user_interrupt"
+                    if user_signal_changed
+                    else ("completed_continued" if continued_task else "sleeping_completed")
                 )
-                summary = parsed.text or final_text
+                summary = "\n\n".join(parsed_texts).strip() or final_text or "Автономный шаг завершился без текстового результата."
+                if continued_task:
+                    summary += " Дальше продолжение этой же задачи уже запланировано."
                 if user_signal_changed:
                     summary += " Во время шага пришло сообщение владельца."
-                self._journal("waiting_user", current_title, summary, task_id=persisted_task_id)
+                self._journal(journal_status, current_title, summary, task_id=persisted_task_id)
                 return
-
-            control_verdict = ""
-            if (
-                not user_signal_changed
-                and (
-                    continuation is not None
-                    or proposed_mission_status in {"continue_now", "follow_up_later", "blocked_user"}
-                    or (current_task is not None and current_task.continuation_count > 0)
-                )
-            ):
-                control_verdict, next_session_id = await self._run_control_pass(
-                    mission=mission,
-                    step_title=effective_title,
-                    step_result=result_text,
-                    proposed_mission_status=proposed_mission_status,
-                    proposed_stage_status=proposed_stage_status,
-                    proposed_next_title=continuation.title if continuation is not None else effective_title,
-                    proposed_next_details=continuation.details if continuation is not None else effective_details,
-                    proposed_delay_sec=continuation.delay_sec if continuation is not None else None,
-                    why_not_done_now=decision.why_not_done_now,
-                    blocker_type=decision.blocker_type,
-                    next_step_justification=decision.next_step_justification,
-                    session_id=session_id,
-                )
-                session_id = next_session_id
-                if session_id:
-                    self._queue_store.set_chat_session_id(chat_id, session_id)
-                if control_verdict == "FORCE_COMPLETE":
-                    proposed_mission_status = "complete"
-                    proposed_stage_status = "complete_mission"
-                    continuation = None
-                elif control_verdict == "FORCE_BLOCKED_USER":
-                    proposed_mission_status = "blocked_user"
-                    proposed_stage_status = "blocked_user"
-                    continuation = None
-                elif control_verdict == "FORCE_STAGE_DONE":
-                    proposed_stage_status = "stage_done"
-                elif control_verdict == "APPROVE_CONTINUE_NOW":
-                    proposed_mission_status = "continue_now"
-                elif control_verdict == "APPROVE_FOLLOWUP":
-                    proposed_mission_status = "follow_up_later"
-                elif control_verdict == "REJECT_AS_MICROSTEP":
-                    proposed_mission_status = "continue_now"
-                    if continuation is None:
-                        continuation = AutonomyContinuation(
-                            action="ENQUEUE",
-                            title=effective_title,
-                            kind=effective_kind,
-                            priority=effective_priority,
-                            delay_sec=0,
-                            details=effective_details or current_details or mission.current_focus or mission.root_objective,
-                        )
-
-            if mission.plan_state == "staged":
-                if proposed_stage_status == "stage_done":
-                    mission = self._advance_stage(
-                        mission,
-                        completion_summary=checkpoint_summary,
-                    )
-                    current_stage = self._current_stage(mission)
-                    if current_stage is None:
-                        proposed_stage_status = "complete_mission"
-                        proposed_mission_status = "complete"
-                        continuation = None
-                    else:
-                        stage_details = "\n".join(
-                            part
-                            for part in (
-                                current_stage.get("goal", "").strip(),
-                                (
-                                    f"Готовность этапа: {current_stage.get('done_when', '').strip()}"
-                                    if current_stage.get("done_when", "").strip()
-                                    else ""
-                                ),
-                            )
-                            if part
-                        ).strip()
-                        continuation = AutonomyContinuation(
-                            action="ENQUEUE",
-                            title=current_stage.get("title", "").strip() or effective_title,
-                            kind=effective_kind,
-                            priority=effective_priority,
-                            delay_sec=0,
-                            details=stage_details or effective_details or mission.current_focus or mission.root_objective,
-                        )
-                        if proposed_mission_status not in {"blocked_user", "complete"}:
-                            proposed_mission_status = (
-                                "continue_now"
-                                if (not user_signal_changed and step_index + 1 < self._settings.autonomy_session_step_limit)
-                                else "follow_up_later"
-                            )
-                elif proposed_stage_status == "blocked_user":
-                    mission = self._advance_stage(
-                        mission,
-                        completion_summary=checkpoint_summary,
-                        blocked=True,
-                    )
-                elif proposed_mission_status in {"continue_now", "follow_up_later"} and continuation is None:
-                    current_stage = self._current_stage(mission)
-                    if current_stage is not None:
-                        stage_details = "\n".join(
-                            part
-                            for part in (
-                                current_stage.get("goal", "").strip(),
-                                (
-                                    f"Готовность этапа: {current_stage.get('done_when', '').strip()}"
-                                    if current_stage.get("done_when", "").strip()
-                                    else ""
-                                ),
-                            )
-                            if part
-                        ).strip()
-                        continuation = AutonomyContinuation(
-                            action="ENQUEUE",
-                            title=current_stage.get("title", "").strip() or effective_title,
-                            kind=effective_kind,
-                            priority=effective_priority,
-                            delay_sec=0 if proposed_mission_status == "continue_now" else self._settings.autonomy_default_sleep_sec,
-                            details=stage_details or effective_details or mission.current_focus or mission.root_objective,
-                        )
-
-            inline_continue = (
-                not user_signal_changed
-                and proposed_mission_status == "continue_now"
-                and step_index + 1 < self._settings.autonomy_session_step_limit
-            )
-            if inline_continue:
-                if continuation is not None:
-                    current_title = continuation.title.strip() or effective_title
-                    current_kind = continuation.kind.strip() or effective_kind
-                    current_details = continuation.details.strip() or effective_details
-                    current_priority = continuation.priority
-                else:
-                    current_title = effective_title
-                    current_kind = effective_kind
-                    current_details = effective_details
-                    current_priority = effective_priority
-                self._autonomy_store.update_mission(
-                    persisted_mission_id,
-                    status="active",
-                    current_focus=current_title,
-                    last_self_check_summary=self_check_summary,
-                )
-                mission = self._autonomy_store.get_mission(persisted_mission_id) or mission
-                continue
-
-            final_text = "\n\n".join(step_results).strip()
-            continued_task = False
-            notification_task_status = "done"
-            notification_task_scheduled_for = ""
-            journal_status = "completed"
-            continuation_limit_reached = (
-                current_task is not None
-                and current_task.continuation_count >= self._settings.autonomy_max_task_continuations
-            )
-            if (
-                continuation is not None
-                and proposed_mission_status == "follow_up_later"
-                and not user_signal_changed
-                and continuation_limit_reached
-            ):
-                final_text = (
-                    f"{final_text}\n\n[autonomy-followup-suppressed: continuation limit reached]"
-                ).strip()
-                proposed_mission_status = "complete"
-
-            if (
-                continuation is not None
-                and proposed_mission_status == "follow_up_later"
-                and not user_signal_changed
-                and not continuation_limit_reached
-            ):
-                followup_delay_sec = max(1, continuation.delay_sec)
-                next_title = continuation.title.strip() or current_title
-                next_details = continuation.details.strip() or current_details
-                next_kind = continuation.kind.strip() or current_kind
-                next_priority = continuation.priority
-                next_scheduled_for = self._scheduled_after(followup_delay_sec)
-                self._autonomy_store.continue_task(
-                    persisted_task_id,
-                    mission_id=persisted_mission_id,
-                    title=next_title,
-                    details=next_details,
-                    kind=next_kind,
-                    priority=next_priority,
-                    scheduled_for=next_scheduled_for,
-                    progress_text=self._compose_stored_result(
-                        final_text,
-                        suffix=suffix,
-                        self_reviews=step_self_reviews,
-                    ),
-                )
-                self._autonomy_store.set_active_mission(
-                    chat_id,
-                    task_id=persisted_task_id,
-                    title=next_title,
-                    details=next_details,
-                    kind=next_kind,
-                    source=persisted_task_source,
-                    phase="scheduled",
-                    scheduled_for=next_scheduled_for,
-                )
-                self._autonomy_store.update_mission(
-                    persisted_mission_id,
-                    status="active",
-                    current_focus=next_title,
-                    last_self_check_summary=self_check_summary,
-                )
-                self._schedule_mode(chat_id, "sleeping_scheduled", delay_sec=followup_delay_sec)
-                continued_task = True
-                current_title = next_title
-                current_details = next_details
-                current_kind = next_kind
-                current_priority = next_priority
-                notification_task_status = "pending"
-                notification_task_scheduled_for = next_scheduled_for
-                journal_status = "continued"
-            else:
-                self._schedule_mode(
-                    chat_id,
-                    "cooldown" if active_request_lines else "idle",
-                    delay_sec=self._settings.autonomy_default_sleep_sec,
-                )
-                self._autonomy_store.complete_task(
-                    persisted_task_id,
-                    self._compose_stored_result(
-                        final_text,
-                        suffix=suffix,
-                        self_reviews=step_self_reviews,
-                    ),
-                )
-                self._autonomy_store.clear_active_mission(chat_id)
-                self._autonomy_store.complete_mission(
-                    persisted_mission_id,
-                    current_focus=current_title,
-                    last_self_check_summary=self_check_summary,
-                )
-            await self._maybe_notify_completion(
-                chat_id=chat_id,
-                task=AutonomyTask(
-                    id=persisted_task_id,
-                    chat_id=chat_id,
-                    mission_id=persisted_mission_id,
-                    kind=current_kind,
-                    title=current_title,
-                    details=current_details,
-                    priority=current_priority,
-                    status=notification_task_status,
-                    created_at=task.created_at if task is not None else "",
-                    scheduled_for=notification_task_scheduled_for,
-                    parent_task_id=persisted_parent_id,
-                    source=persisted_task_source,
-                    started_at=task.started_at if task is not None else None,
-                    finished_at=None,
-                    blocked_user_signal=None,
-                    result_text=final_text,
-                    error_text="",
-                ),
-                text="\n\n".join(parsed_texts).strip() or final_text,
-                file_paths=parsed.file_paths,
-                user_signal_changed=user_signal_changed,
-                raw_message=final_text,
-            )
-            self._autonomy_store.mark_heartbeat(
-                "completed_after_user_interrupt"
-                if user_signal_changed
-                else ("completed_continued" if continued_task else "completed")
-            )
-            summary = "\n\n".join(parsed_texts).strip() or final_text or "Автономный шаг завершился без текстового результата."
-            if continued_task:
-                summary += " Дальше продолжение этой же задачи уже запланировано."
-            if user_signal_changed:
-                summary += " Во время шага пришло сообщение владельца."
-            self._journal(journal_status, current_title, summary, task_id=persisted_task_id)
-            return
+        finally:
+            if guard_approval_used:
+                self._consume_guard_approval(chat_id)
 
     async def _maybe_notify_completion(
         self,

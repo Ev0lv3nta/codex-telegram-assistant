@@ -367,6 +367,103 @@ class AutonomyStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_create_list_and_pause_resume_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                schedule_id = store.create_schedule(
+                    chat_id=101,
+                    title="Daily digest",
+                    prompt_text="Собери ежедневную сводку.",
+                    timezone="Europe/Moscow",
+                    recurrence_kind="daily",
+                    recurrence_json={"time": "20:00"},
+                    next_run_at="2026-03-14T17:00:00+00:00",
+                    delivery_hint="html",
+                )
+                schedule = store.get_schedule(schedule_id, chat_id=101)
+                self.assertIsNotNone(schedule)
+                assert schedule is not None
+                self.assertEqual(schedule.delivery_hint, "html")
+                self.assertTrue(schedule.active)
+
+                listed = store.list_schedules(chat_id=101)
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(listed[0].id, schedule_id)
+
+                self.assertTrue(store.pause_schedule(schedule_id, chat_id=101))
+                paused = store.get_schedule(schedule_id, chat_id=101)
+                self.assertIsNotNone(paused)
+                assert paused is not None
+                self.assertFalse(paused.active)
+                self.assertEqual(paused.last_status, "paused")
+
+                self.assertTrue(
+                    store.resume_schedule(
+                        schedule_id,
+                        chat_id=101,
+                        next_run_at="2026-03-15T17:00:00+00:00",
+                    )
+                )
+                resumed = store.get_schedule(schedule_id, chat_id=101)
+                self.assertIsNotNone(resumed)
+                assert resumed is not None
+                self.assertTrue(resumed.active)
+                self.assertEqual(resumed.next_run_at, "2026-03-15T17:00:00+00:00")
+            finally:
+                store.close()
+
+    def test_due_schedule_and_active_task_linkage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                schedule_id = store.create_schedule(
+                    chat_id=101,
+                    title="Weekly report",
+                    prompt_text="Собери weekly report.",
+                    timezone="Europe/Moscow",
+                    recurrence_kind="weekly",
+                    recurrence_json={"weekday": 0, "time": "09:00"},
+                    next_run_at="2026-03-09T06:00:00+00:00",
+                )
+                due = store.list_due_schedules(
+                    chat_id=101,
+                    now="2026-03-09T06:01:00+00:00",
+                )
+                self.assertEqual(len(due), 1)
+                self.assertEqual(due[0].id, schedule_id)
+
+                task_id = store.enqueue_task(
+                    chat_id=101,
+                    schedule_id=schedule_id,
+                    title="Run scheduled job",
+                    source="scheduled",
+                )
+                self.assertGreater(task_id, 0)
+                self.assertTrue(store.has_active_task_for_schedule(101, schedule_id))
+
+                store.complete_task(task_id, "done")
+                self.assertFalse(store.has_active_task_for_schedule(101, schedule_id))
+            finally:
+                store.close()
+
+    def test_pending_schedule_confirmation_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = AutonomyStore(Path(td) / "bot_state.db")
+            try:
+                payload = {
+                    "action": "create",
+                    "title": "Digest",
+                    "prompt_text": "Сделай digest",
+                }
+                store.set_pending_schedule_confirmation(101, payload)
+                restored = store.get_pending_schedule_confirmation(101)
+                self.assertEqual(restored, payload)
+                store.clear_pending_schedule_confirmation(101)
+                self.assertIsNone(store.get_pending_schedule_confirmation(101))
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

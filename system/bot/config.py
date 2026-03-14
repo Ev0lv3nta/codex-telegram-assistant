@@ -58,6 +58,8 @@ class Settings:
     autonomy_heartbeat_sec: int = 300
     autonomy_loop_poll_sec: int = 1800
     autonomy_default_sleep_sec: int = 7200
+    autonomy_post_complete_sleep_sec: int = 10800
+    autonomy_empty_idle_sleep_sec: int = 10800
     autonomy_busy_retry_sec: int = 120
     autonomy_session_step_limit: int = 4
     autonomy_max_task_continuations: int = 5
@@ -67,6 +69,9 @@ class Settings:
     autonomy_idle_ask_enabled: bool = True
     autonomy_idle_ask_cooldown_sec: int = 21600
     autonomy_idle_sleep_sec: int = 21600
+    autonomy_guard_max_continuous_runtime_sec: int = 1200
+    autonomy_guard_max_codex_calls_per_hour: int = 3
+    autonomy_guard_rolling_window_sec: int = 3600
     session_lease_sec: int = 1860
 
     @classmethod
@@ -116,6 +121,12 @@ class Settings:
             autonomy_default_sleep_sec=_parse_int(
                 os.getenv("AUTONOMY_DEFAULT_SLEEP_SEC"), 7200
             ),
+            autonomy_post_complete_sleep_sec=_parse_int(
+                os.getenv("AUTONOMY_POST_COMPLETE_SLEEP_SEC"), 10800
+            ),
+            autonomy_empty_idle_sleep_sec=_parse_int(
+                os.getenv("AUTONOMY_EMPTY_IDLE_SLEEP_SEC"), 10800
+            ),
             autonomy_busy_retry_sec=_parse_int(
                 os.getenv("AUTONOMY_BUSY_RETRY_SEC"), 120
             ),
@@ -133,5 +144,14 @@ class Settings:
                 os.getenv("AUTONOMY_IDLE_ASK_COOLDOWN_SEC"), 21600
             ),
             autonomy_idle_sleep_sec=_parse_int(os.getenv("AUTONOMY_IDLE_SLEEP_SEC"), 21600),
+            autonomy_guard_max_continuous_runtime_sec=_parse_int(
+                os.getenv("AUTONOMY_GUARD_MAX_CONTINUOUS_RUNTIME_SEC"), 1200
+            ),
+            autonomy_guard_max_codex_calls_per_hour=_parse_int(
+                os.getenv("AUTONOMY_GUARD_MAX_CODEX_CALLS_PER_HOUR"), 3
+            ),
+            autonomy_guard_rolling_window_sec=_parse_int(
+                os.getenv("AUTONOMY_GUARD_ROLLING_WINDOW_SEC"), 3600
+            ),
             session_lease_sec=_parse_int(os.getenv("BOT_SESSION_LEASE_SEC"), 1860),
         )
